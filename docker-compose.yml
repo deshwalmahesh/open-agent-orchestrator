@@ -1,0 +1,11 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    image: configurable-agent-backend:dev
+    container_name: ca-backend
+    env_file:
+      - ./backend/.env
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

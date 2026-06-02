@@ -1,9 +1,8 @@
 # AI Agent Orchestration Platform
 
-Users sign up, create agents (system prompt + model + tools), open chats, and
-talk to them either via HTTP or via a Slack DM. Conversations are persisted, runs
-are observable via Server-Sent Events, and 2 visual workflow templates ship
-pre-seeded.
+Create AI agents with configurable personality, tools, and memory. Connect them
+into supervisor trees where agents delegate to sub-agents autonomously. Talk to
+them via the web UI or Slack DM. Observe runs in real-time via SSE.
 
 ---
 
@@ -12,20 +11,21 @@ pre-seeded.
 ```mermaid
 flowchart LR
   subgraph Control["Control plane (FastAPI)"]
-    A[auth/users] --> R1[/agents /personas /workflows/]
+    A[auth/users] --> R1[/agents /personas/]
     R1 --> R2[/chats POST messages/]
-    R2 --> R3[/runs SSE events + messages/]
+    R2 --> R3[/runs SSE events/]
+    R1 --> R4[/tools GET available/]
   end
 
   subgraph Runtime["Runtime"]
-    RS[run_service<br/>asyncio task] --> BA[build_agent<br/>langchain create_agent]
-    BA --> LL[ChatOpenAI<br/>vLLM/OpenAI/etc]
+    RS[run_service<br/>asyncio task] --> BA[build_agent_tree<br/>recursive sub-agents]
+    BA --> LL[ChatOpenAI<br/>vLLM / OpenAI / etc]
     BA --> TR[Tool registry<br/>calculator, web_search, ...]
-    CP[compiler<br/>WorkflowDef → StateGraph]
+    BA --> SA2[Sub-agent tools<br/>agent-as-tool wrapping]
   end
 
   subgraph Persist["Persistence (SQLAlchemy 2.0 async)"]
-    SQL[(SQLite v1<br/>→ Postgres URL swap)]
+    SQL[(SQLite v1<br/>Postgres URL swap)]
   end
 
   subgraph Channels["Channels"]
@@ -37,24 +37,22 @@ flowchart LR
   RS --> EM[RunEventEmitter<br/>DB + in-process queue]
   EM --> R3
   SA --> RS
-  RS -. fires .-> SA
 ```
 
 Three boundaries:
 
 - **Control plane (`app/api/`)** — thin routers, body validation, owner checks.
-- **Runtime (`app/runtime/`, `app/services/`)** — agent compilation, run scheduling, memory.
-- **Persistence (`app/db/`)** — one ORM file, repo helpers, idempotent schema bootstrap + template seed.
+- **Runtime (`app/runtime/`, `app/services/`)** — agent tree compilation, run scheduling, memory.
+- **Persistence (`app/db/`)** — one ORM file, repo helpers, idempotent schema bootstrap.
 
 ---
 
 ## Runtime choice — LangGraph + `langchain.agents.create_agent`
 
-- **LangGraph** for graph compilation (workflow nodes, conditional edges, recursion limits for feedback loops). Battle-tested checkpointer/interrupt seam for future HITL.
-- **`langchain.agents.create_agent`** (the non-deprecated ReAct loop) instead of a hand-rolled agent_node — fewer LOC, correct tool-call routing, OpenAI-compatible model swap by changing `base_url`.
-- Tools are LangChain `BaseTool` (built-ins + `@tool`-decorated): one flat `dict[str, BaseTool]` registry. Adding MCP tools later = adapter wrapper, no other change.
-
-Multi-agent runtime is OUT of v1; the seam is the registry — `agent_as_tool(agent_id)` is a one-screen factory when the second-agent loop ships.
+- **LangGraph** for agent compilation (ReAct tool-call loop, recursion limits). Checkpointer seam for future HITL.
+- **`langchain.agents.create_agent`** (non-deprecated ReAct loop) — fewer LOC, correct tool-call routing, model swap by changing `base_url`.
+- Tools are LangChain `BaseTool` (`@tool`-decorated): flat `dict[str, BaseTool]` registry.
+- **Multi-agent = supervisor tree.** Sub-agents are wrapped as LangChain tools via `build_agent_tree`. The parent LLM tool-calls a sub-agent by name with a `task` string; the sub-agent runs its own ReAct loop and returns. Nesting capped at depth 4. Cycles rejected at config-save time via DFS.
 
 ---
 
@@ -62,22 +60,18 @@ Multi-agent runtime is OUT of v1; the seam is the registry — `agent_as_tool(ag
 
 | Requirement | Status | Where |
 |---|---|---|
-| Agent CRUD (name, role, system_prompt, model, tools, channels) | ✅ | `app/api/agents.py`, `domain.AgentConfig` |
-| Agent config: memory + limits + guardrails + skills + schedules | ✅ schema, ✅ memory enforced | `domain.MemoryConfig`, `services/run_service.py::_resolve_context` |
-| Visual workflow builder (conditions + feedback loops) | ✅ backend | `app/runtime/compiler.py` (AST-whitelist condition eval) |
-| ≥ 2 pre-built workflow templates | ✅ | `app/db/seeds.py` (`research-and-write`, `supervised-loop`) |
-| External channel — Slack | ✅ | `app/integrations/channels/slack_adapter.py` |
-| Live monitoring (logs + inter-agent msgs + token/cost) | ✅ | SSE `GET /runs/{id}/events`, `run.finished` event carries `usage` |
-| Message history persisted | ✅ | `MessageDB` + `GET /chats/{id}/messages` |
-| 2+ agents executing real task | ✅ (live LLM e2e test) | `tests/integration/test_run_live.py`, supervised-loop template |
-| Clear UI/runtime/persistence separation | ✅ | three top-level packages, no cross-leakage |
-| Tests for critical paths | ✅ 75 tests passing | `tests/integration/` (auth, CRUD, isolation, live LLM, SSE, Slack) |
-| README + setup + runtime justification | ✅ | this file |
-| Async communication | ✅ | FastAPI + asyncio + `AsyncOpenAI` |
-
-Deferred (documented in `memory/project-deferred-features.md`): Langfuse,
-guardrails enforcement at node level, HITL, schedules executor, per-user Slack
-BYOK, Postgres-by-default, multi-agent runtime, streaming, FastMCP.
+| Agent CRUD (name, role, system_prompt, model, tools, channels) | Done | `app/api/agents.py`, `domain.AgentConfig` |
+| Agent config: memory + limits + guardrails + skills + schedules | Schema + memory enforced | `domain.MemoryConfig`, `run_service::_resolve_context` |
+| Multi-agent (supervisor tree, arbitrary nesting) | Done | `app/runtime/agent.py::build_agent_tree` (recursive), depth cap 4, cycle detection at save |
+| External channel — Slack | Done | `app/integrations/channels/slack_adapter.py` (Bolt Socket Mode) |
+| Live monitoring (logs + inter-agent msgs + token/cost) | Done | SSE `GET /runs/{id}/events`, `run.finished` carries `usage` |
+| Message history persisted | Done | `MessageDB` + `GET /chats/{id}/messages` |
+| 2+ agents executing real task | Done | Live e2e test: Boss delegates to Researcher (web_search) |
+| Clear UI/runtime/persistence separation | Done | Three top-level packages |
+| Tests for critical paths | 67 tests | Auth, CRUD, sub-agent tree validation, live LLM delegation, Slack dispatch |
+| Async communication | Done | FastAPI + asyncio + AsyncOpenAI |
+| Dynamic tool discovery | Done | `GET /tools` returns REGISTRY keys + descriptions |
+| Chat agent reassignment | Done | `PATCH /chats/{id}` with new `agent_id` |
 
 ---
 
@@ -85,15 +79,13 @@ BYOK, Postgres-by-default, multi-agent runtime, streaming, FastMCP.
 
 `MemoryConfig` (per-agent): `{type: "summary"|"buffer"|"none", window: N, summary_threshold: M}`.
 
-Default `type="summary"` with `N=10`, `M=20`. Reason: **N < M**. Per-turn context = `summary_tokens + N * avg_msg_tokens`; verbatim is the expensive part, so keep N small. M (batch size before fold) is larger so each summarisation LLM call processes a worthwhile chunk — fewer round-trips, lower cost.
-
-Trigger: once unsummarised history > N + M, the oldest M turns are folded into the rolling `summary` (stored on `ChatDB.summary`, count tracked in `summary_count`). Old `MessageDB` rows are **never deleted** — they stay for audit; they just stop being fed to the agent.
+Default `N=10`, `M=20` (`N < M`). Verbatim context = last N messages. Once unsummarised history exceeds N+M, the oldest M turns fold into a rolling summary (stored on `ChatDB.summary`). Old `MessageDB` rows are never deleted — they stay for audit.
 
 ---
 
 ## Setup
 
-### One-command local (SQLite + no Slack)
+### One-command local (SQLite, no Slack)
 
 ```bash
 cd backend
@@ -101,8 +93,7 @@ cp .env.example .env   # set VLLM_BASE_URL / VLLM_API_KEY / VLLM_DEFAULT_MODEL
 make demo              # uv sync + uvicorn :8000
 ```
 
-`make demo` starts FastAPI, runs `create_all`, seeds the 2 workflow templates.
-Open `http://localhost:8000/docs` for OpenAPI.
+Open `http://localhost:8000/docs` for OpenAPI. Frontend runs separately (`cd frontend && npm run dev`).
 
 ### With Slack (Socket Mode)
 
@@ -110,20 +101,20 @@ Add to `backend/.env`:
 
 ```
 SLACK_BOT_TOKEN=xoxb-...
-SLACK_APP_TOKEN=xapp-...    # Socket Mode
+SLACK_APP_TOKEN=xapp-...
 ```
 
-Restart — the adapter auto-starts on lifespan. DM the bot; reply lands on the same thread.
+Restart — adapter auto-starts. DM the bot; reply lands on the same thread.
 
-To attach yourself: register via web (`POST /auth/register`), then `PATCH /users/me {"slack_user_id":"U..."}`. No auto-provision in v1 (one auth path, deliberately).
+To link your Slack user: `POST /auth/register`, then `PATCH /users/me {"slack_user_id":"U..."}`.
 
-### Full stack (Postgres + Redis via Docker)
+### Full stack (Redis via Docker)
 
 ```bash
-docker compose up -d   # redis + backend (Postgres = URL-swap)
+docker compose up -d   # redis + backend
 ```
 
-For Postgres prod: set `DATABASE_URL=postgresql+asyncpg://...` and add Alembic migrations (v1 ships `create_all` only — see "SQLite → Postgres" below).
+For Postgres: set `DATABASE_URL=postgresql+asyncpg://...` and add Alembic migrations.
 
 ---
 
@@ -131,25 +122,29 @@ For Postgres prod: set `DATABASE_URL=postgresql+asyncpg://...` and add Alembic m
 
 ```bash
 cd backend
-make test    # 75 integration tests
+make test    # 67 tests
 ```
 
-Live-LLM and live-Tavily tests auto-skip when their env vars are unset, so the
-suite passes offline.
+Live-LLM and live-Tavily tests auto-skip when env vars are unset.
 
 ---
 
-## SQLite → Postgres swap
+## API endpoints
 
-Set `DATABASE_URL=postgresql+asyncpg://user:pw@host/db`. SQLAlchemy code path is identical (async engine). For prod, add Alembic and remove `create_all` from `app/main.py::lifespan`. The two new columns on `ChatDB` (`summary`, `summary_count`) and the `RunEventDB` composite PK are vanilla SQL — both portable.
-
----
-
-## Add a workflow template
-
-Edit `app/db/seeds.py`: define a `WorkflowDef`, append to `_TEMPLATES`. Lifespan seeds it idempotently on next boot (keyed by name).
-
-A template uses `agent` node `ref` strings as ROLE names (`researcher`, `worker`); the run-time binds them to the caller's agents (Step B today wires single-agent chats; the workflow runner extension is a small add on top of the compiler).
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| POST | /auth/register | No | Create user |
+| POST | /auth/jwt/login | No | Returns JWT |
+| GET/PATCH | /users/me | JWT | Profile + slack_user_id |
+| GET/POST/PUT/DELETE | /agents | JWT | Full AgentConfig CRUD. POST/PUT validate sub-agent tree |
+| GET/POST/PUT/DELETE | /personas | JWT | Named system_prompt library |
+| GET/POST/PATCH/DELETE | /chats | JWT | PATCH reassigns agent_id / persona_id |
+| POST | /chats/{id}/messages | JWT | Schedule run, returns run_id |
+| GET | /chats/{id}/messages | JWT | Message history |
+| GET | /runs/{id} | JWT | Run status + tokens + cost |
+| GET | /runs/{id}/events | JWT or ?token= | SSE stream (backlog + live) |
+| GET | /tools | No | Available tool names + descriptions |
+| GET | /health | No | `{"status": "ok"}` |
 
 ---
 
@@ -157,22 +152,42 @@ A template uses `agent` node `ref` strings as ROLE names (`researcher`, `worker`
 
 Mirror `app/integrations/channels/slack_adapter.py`:
 
-1. Take credentials from `Settings` (add fields to `app/config.py`).
-2. Wire a class with `start()` / `stop()` started in `main.py::lifespan` behind a creds-guard.
-3. Implement an inbound handler: lookup user, find/create chat keyed by an external-thread identifier, call `start_run(session, chat_id=..., user_text=...)`, await reply via `wait_for_reply(run_id)`, post back to the channel.
+1. Add credentials to `app/config.py::Settings`.
+2. Wire a class with `start()` / `stop()` in `main.py::lifespan` behind a creds-guard.
+3. Inbound handler: lookup user, find/create chat, call `start_run`, await `wait_for_reply`, post back.
 
-`handle_slack_message` is a pure function on the dispatch side — no Bolt-isms in the business logic.
+---
+
+## Langfuse (optional tracing)
+
+```bash
+pip install langfuse
+export LANGFUSE_PUBLIC_KEY=pk-...
+export LANGFUSE_SECRET_KEY=sk-...
+export LANGFUSE_HOST=https://cloud.langfuse.com
+```
+
+Wire into `run_service._execute`:
+
+```python
+from langfuse.langchain import CallbackHandler
+result = await agent.ainvoke(
+    {"messages": lc_messages},
+    config={"callbacks": [CallbackHandler()], "recursion_limit": ...},
+)
+```
 
 ---
 
 ## Notable design decisions
 
-- **No checkpointer for chat memory.** Chat history is rebuilt from `MessageDB` each turn (with rolling summary above). The Redis checkpointer seam is kept in `build_agent` for future HITL/interrupt work; lifespan tolerates Redis being down.
-- **DB polling, not emitter queue, in the Slack reply path.** `start_run` returns before the background task starts; the emitter for that run isn't guaranteed to be in `EMITTERS` yet. Polling `RunDB.status` is robust, race-free, and fine at human-DM cadence (~250ms).
-- **No `ChannelGateway` Protocol.** YAGNI — one channel today; the next channel can be a 50-LOC file mirroring `slack_adapter.py`. No interface ceremony until there's a second implementation.
-- **No clone-on-register.** New users see the 2 templates as read-only (`user_id IS NULL`). To fork: `GET /workflows/{tmpl}` → `POST /workflows` with the same definition. Lazy fork beats eager copy of work most users won't touch.
-- **404, not 403, on cross-user reads.** We don't leak resource existence.
-- **AST-whitelist condition eval, not `eval()`.** `app/runtime/compiler.py::_ALLOWED` rejects calls, lambdas, comprehensions, attribute imports. Tested.
+- **Supervisor tree, not DAG.** Agent IS the workflow. Sub-agents are tools. No separate workflow primitive, no compiler, no condition DSL. The LLM decides routing.
+- **No checkpointer for chat memory.** History rebuilt from `MessageDB` each turn (with rolling summary). Redis seam kept for future HITL.
+- **DB polling in Slack reply path.** `start_run` returns before the bg task starts; polling `RunDB.status` is race-free.
+- **SSE dual auth.** `GET /runs/{id}/events` accepts both `Authorization: Bearer` header and `?token=` query param (EventSource can't send headers).
+- **Hard-delete agents, nullable chat FK.** Deleting an agent sets `ChatDB.agent_id = NULL`. User reassigns via `PATCH /chats/{id}`.
+- **404, not 403, on cross-user reads.** No existence leak.
+- **MAX_AGENT_DEPTH = 4.** Enforced at config save (DFS cycle + depth check) AND at runtime (defence in depth).
 
 ---
 

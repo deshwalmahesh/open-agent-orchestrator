@@ -139,6 +139,10 @@ async def handle_slack_message(
         chat = await _find_or_create_chat(
             session, user_id=user.id, agent_id=agent.id, channel=channel, thread_ts=thread_ts
         )
+        # Agent was deleted since the chat was created — reassign to newest.
+        if chat.agent_id is None:
+            chat.agent_id = agent.id
+            await session.commit()
         run_id = await start_run(session, chat_id=chat.id, user_text=text)
 
     status, reply = await wait_for_reply(run_id, timeout=120.0)

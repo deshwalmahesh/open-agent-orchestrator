@@ -58,21 +58,29 @@ async def python_sandbox(code: str) -> str:
     return out.decode(errors="replace")
 
 
-def build_registry(*, tavily_api_key: str | None = None) -> dict[str, BaseTool]:
+def build_registry(*, tool_configs: dict[str, dict] | None = None) -> dict[str, BaseTool]:
     """Assemble a tool registry. Stateless tools always included; credentialed
-    tools included only when their credential is provided."""
+    tools included only when their credential is provided via tool_configs.
+    tool_configs keys are tool names, values are config dicts (e.g. {"api_key": "..."})."""
     reg: dict[str, BaseTool] = {
         "calculator": calculator,
         "html_to_markdown": html_to_markdown,
         "pdf_to_text": pdf_to_text,
         "python_sandbox": python_sandbox,
     }
-    if tavily_api_key:
-        reg["web_search"] = TavilySearch(max_results=5, tavily_api_key=tavily_api_key)
+    configs = tool_configs or {}
+    tavily_key = configs.get("web_search", {}).get("api_key")
+    if tavily_key:
+        reg["web_search"] = TavilySearch(max_results=5, tavily_api_key=tavily_key)
     return reg
 
 
-REGISTRY: dict[str, BaseTool] = build_registry(tavily_api_key=get_settings().tavily_api_key)
+# Global registry — uses platform-level keys from .env. Per-user registries
+# are built at runtime with user-provided keys from UserToolConfigDB.
+_global_tavily = get_settings().tavily_api_key
+REGISTRY: dict[str, BaseTool] = build_registry(
+    tool_configs={"web_search": {"api_key": _global_tavily}} if _global_tavily else None,
+)
 if "web_search" not in REGISTRY:
     log.warning("tools.web_search.disabled", reason="TAVILY_API_KEY not configured")
 

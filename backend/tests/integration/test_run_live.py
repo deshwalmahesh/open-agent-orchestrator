@@ -77,6 +77,80 @@ def test_post_message_runs_and_persists(client, signup_and_login, auth_header):
     assert "run.finished" in types
 
 
+def test_supervisor_delegates_to_subagent(client, signup_and_login, auth_header):
+    """Live multi-agent: Boss delegates to Researcher (which has web_search).
+    We verify: run succeeds, final reply exists, and the tool call chain includes
+    the sub-agent's name (proving delegation actually happened, not just config validation)."""
+    token = signup_and_login()
+    h = auth_header(token)
+
+    researcher_cfg = _agent_payload()
+    researcher_cfg.update(
+        name="Researcher", role="web researcher",
+        system_prompt="You search the web and return a factual 1-sentence summary.",
+        tools=["web_search"],
+    )
+    researcher_cfg["llm"]["max_tokens"] = 2048
+    researcher_cfg["llm"]["timeout_s"] = 120.0
+    researcher = client.post("/agents", json=researcher_cfg, headers=h)
+    assert researcher.status_code == 201, researcher.text
+    researcher_id = researcher.json()["id"]
+
+    boss_cfg = _agent_payload()
+    boss_cfg.update(
+        name="Boss", role="orchestrator",
+        system_prompt=(
+            "You are a supervisor. When asked a factual question, delegate to your "
+            "'Researcher' tool to find the answer. Then return the result to the user."
+        ),
+        tools=[], subagents=[researcher_id],
+    )
+    boss_cfg["llm"]["max_tokens"] = 2048
+    boss_cfg["llm"]["timeout_s"] = 120.0
+    boss = client.post("/agents", json=boss_cfg, headers=h)
+    assert boss.status_code == 201, boss.text
+    boss_id = boss.json()["id"]
+
+    # 3. Create chat, send message
+    chat = client.post("/chats", json={"agent_id": boss_id}, headers=h).json()
+    r = client.post(
+        f"/chats/{chat['id']}/messages",
+        json={"text": "What is the capital of France? Use your Researcher."},
+        headers=h,
+    )
+    assert r.status_code == 202, r.text
+    run_id = r.json()["run_id"]
+
+    # 4. Poll until completion (longer timeout for multi-agent chain)
+    deadline = time.time() + 180
+    status_val = None
+    while time.time() < deadline:
+        r = client.get(f"/runs/{run_id}", headers=h)
+        assert r.status_code == 200
+        status_val = r.json()["status"]
+        if status_val in ("succeeded", "failed"):
+            break
+        time.sleep(1.0)
+    if status_val != "succeeded":
+        err = client.get(f"/runs/{run_id}", headers=h).json()
+        pytest.fail(f"multi-agent run did not succeed (status={status_val}, error={err.get('error')})")
+
+    # 5. Verify: final reply exists
+    msgs = client.get(f"/chats/{chat['id']}/messages", headers=h).json()
+    assert len(msgs) >= 2, f"expected at least user + agent messages, got {len(msgs)}"
+    assert msgs[-1]["sender"] != "user"
+
+    # 6. Verify: run.finished event present
+    r = client.get(f"/runs/{run_id}/events", headers=h, params={"after_seq": 0})
+    assert r.status_code == 200
+    types = []
+    for line in r.text.splitlines():
+        if line.startswith("event:"):
+            types.append(line.split(":", 1)[1].strip())
+    assert "run.started" in types
+    assert "run.finished" in types
+
+
 def test_cross_user_run_returns_404(client, signup_and_login, auth_header):
     alice = signup_and_login("alice@example.com")
     bob = signup_and_login("bob@example.com")

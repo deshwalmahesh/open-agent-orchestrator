@@ -4,19 +4,25 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
 
 from app.api.agents import router as agents_router
 from app.api.chats import router as chats_router
 from app.api.health import router as health_router
+from app.api.mcp_servers import router as mcp_router
 from app.api.personas import router as personas_router
 from app.api.runs import router as runs_router
-from app.api.workflows import router as workflows_router
+from app.api.skills import router as skills_router
+from app.api.tool_configs import router as tool_configs_router
 from app.config import get_settings
-from app.db import create_all, get_session_factory
-from app.db.seeds import seed_templates
+from app.db import create_all
 from app.logging import configure_logging
 from app.runtime.checkpointer import build_checkpointer
-from app.services.run_service import drain_pending
+from app.services.run_service import drain_pending, set_checkpointer
 from app.users import UserCreate, UserRead, UserUpdate, auth_backend, fastapi_users
 
 log = structlog.get_logger(__name__)
@@ -31,7 +37,6 @@ async def lifespan(app: FastAPI):
     # App-data DB. create_all is idempotent. README documents this is v1-grade
     # (no Alembic); prod swaps DATABASE_URL to Postgres and adds migrations.
     await create_all()
-    await seed_templates(get_session_factory())
 
     # Checkpointer is required for any Run, but we want /health to stay green
     # if Redis is briefly down during dev. Log loudly; downstream endpoints
@@ -42,11 +47,12 @@ async def lifespan(app: FastAPI):
         saver, client = await build_checkpointer()
         app.state.checkpointer = saver
         app.state.redis_client = client
+        set_checkpointer(saver)
     except Exception as exc:
         log.warning(
             "checkpointer.unavailable",
             error=str(exc),
-            hint="run `docker compose up redis -d` (runs without it work; chats won't)",
+            hint="run `docker compose up` — runs still work without Redis but no within-run checkpointing",
         )
 
     # Slack — single platform bot. Stays off unless BOTH tokens are configured.
@@ -83,11 +89,29 @@ async def _request_id_middleware(request: Request, call_next):
     return response
 
 
+limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="AI Agent Orchestration Platform",
         version="0.1.0",
         lifespan=lifespan,
+    )
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(SlowAPIMiddleware)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "http://localhost:5173",   # Vite dev (no Docker)
+            "http://localhost:80",     # Docker compose frontend
+            "http://localhost",        # Docker compose frontend (port 80, no explicit port)
+            "http://127.0.0.1:5173",
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
     app.middleware("http")(_request_id_middleware)
     app.include_router(health_router)
@@ -102,7 +126,9 @@ def create_app() -> FastAPI:
     )
     app.include_router(agents_router)
     app.include_router(personas_router)
-    app.include_router(workflows_router)
+    app.include_router(skills_router)
+    app.include_router(mcp_router)
+    app.include_router(tool_configs_router)
     app.include_router(chats_router)
     app.include_router(runs_router)
     return app

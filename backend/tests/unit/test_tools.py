@@ -37,11 +37,11 @@ async def test_python_sandbox_raises_on_timeout():
         await python_sandbox.ainvoke({"code": "import time; time.sleep(10)"})
 
 
-def test_per_agent_byok_isolation():
+def test_per_user_byok_isolation():
     """Two different Tavily keys → two different web_search instances.
     Stateless tools shared. Locks the 'use ours / BYOK' seam."""
-    a = build_registry(tavily_api_key="tvly-user-a")
-    b = build_registry(tavily_api_key="tvly-user-b")
+    a = build_registry(tool_configs={"web_search": {"api_key": "tvly-user-a"}})
+    b = build_registry(tool_configs={"web_search": {"api_key": "tvly-user-b"}})
     assert "web_search" in a and "web_search" in b
     assert a["web_search"] is not b["web_search"]
     assert a["calculator"] is b["calculator"]

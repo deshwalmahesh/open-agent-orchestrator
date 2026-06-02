@@ -1,8 +1,7 @@
-"""All domain schemas + typed errors in one file.
+"""Domain schemas: AgentConfig, LLMConfig, MemoryConfig, RunEvent.
 
-Pydantic for anything that crosses a serialization boundary (DB rows, HTTP
-bodies, SSE events). Tool types live in LangChain (BaseTool); no custom
-ToolSpec / ToolContext / ToolResult here.
+ORM models live in db/models.py; these are the Pydantic contracts for
+serialization boundaries (HTTP bodies, SSE events, JSON config blobs).
 """
 
 from __future__ import annotations
@@ -20,37 +19,6 @@ def utcnow() -> datetime:
 
 class _Base(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
-
-
-class User(_Base):
-    id: UUID = Field(default_factory=uuid4)
-    name: str
-    slack_user_id: str | None = None
-    created_at: datetime = Field(default_factory=utcnow)
-    updated_at: datetime = Field(default_factory=utcnow)
-
-
-class Persona(_Base):
-    """Named system_prompt. user_id=None = global (read-only); otherwise owned by that user."""
-
-    id: UUID = Field(default_factory=uuid4)
-    user_id: UUID | None = None
-    name: str
-    system_prompt: str
-
-
-class Chat(_Base):
-    """Conversational thread. persona_id, when set, overrides the agent's system_prompt at run time."""
-
-    id: UUID = Field(default_factory=uuid4)
-    user_id: UUID
-    agent_id: UUID
-    persona_id: UUID | None = None
-    channel: Literal["web", "slack"] = "web"
-    external_thread_id: str | None = None
-    title: str | None = None
-    created_at: datetime = Field(default_factory=utcnow)
-    updated_at: datetime = Field(default_factory=utcnow)
 
 
 class LLMConfig(_Base):
@@ -108,80 +76,14 @@ class AgentConfig(_Base):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     limits: Limits = Field(default_factory=Limits)
     guardrails: Guardrails = Field(default_factory=Guardrails)
-    # Flattened from prior InteractionRules sub-model:
-    can_delegate_to: list[UUID] = Field(default_factory=list)
-    expose_as_tool: bool = False
-    skills: list[str] = Field(default_factory=list)
+    subagents: list[UUID] = Field(default_factory=list)  # agent UUIDs wrapped as tools at runtime
+    skills: list[UUID] = Field(default_factory=list)  # SkillDB UUIDs — content injected into prompt at runtime
+    mcp_servers: list[UUID] = Field(default_factory=list)  # MCPServerDB UUIDs — tools discovered at runtime
     schedules: list[str] = Field(default_factory=list)  # cron strings; stretch (P6)
     channels: list[ChannelBinding] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
-
-
-NodeType = Literal["start", "agent", "tool", "condition", "human", "end"]
-
-
-class NodeDef(_Base):
-    id: str
-    type: NodeType
-    ref: str | None = None  # agent UUID (str) or tool name; None for start/end/condition
-    config: dict[str, Any] = Field(default_factory=dict)
-    position: dict[str, float] | None = None  # UI passthrough
-
-
-class EdgeDef(_Base):
-    id: str
-    source: str
-    target: str
-    condition: str | None = None  # safe expr; only meaningful on conditional source
-
-
-class WorkflowDef(_Base):
-    id: UUID = Field(default_factory=uuid4)
-    name: str
-    description: str = ""
-    entry: str
-    nodes: list[NodeDef]
-    edges: list[EdgeDef]
-    is_template: bool = False
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=utcnow)
-    updated_at: datetime = Field(default_factory=utcnow)
-
-
-MessageSender = str  # "user" | "system" | agent UUID string
-
-
-class Message(_Base):
-    """One model for both in-graph accumulator and persisted DB row.
-
-    id/chat_id/run_id are None for in-flight messages; populated when persisted.
-    """
-
-    id: UUID | None = None
-    chat_id: UUID | None = None
-    run_id: UUID | None = None
-    sender: MessageSender
-    recipient: MessageSender | None = None
-    content: str
-    ts: datetime = Field(default_factory=utcnow)
-
-
-RunStatus = Literal["pending", "running", "succeeded", "failed", "interrupted"]
-
-
-class Run(_Base):
-    id: UUID = Field(default_factory=uuid4)
-    chat_id: UUID
-    agent_id: UUID | None = None
-    workflow_id: UUID | None = None
-    status: RunStatus = "pending"
-    started_at: datetime = Field(default_factory=utcnow)
-    ended_at: datetime | None = None
-    total_tokens: dict[str, int] = Field(default_factory=dict)  # prompt/completion/total
-    total_cost: float = 0.0
-    error: str | None = None
 
 
 EventType = Literal[
@@ -208,31 +110,3 @@ class RunEvent(_Base):
     data: dict[str, Any] = Field(default_factory=dict)
 
 
-class AppError(Exception):
-    """Base for all domain/runtime errors."""
-
-
-class NotFoundError(AppError):
-    def __init__(self, resource: str, ident: str | UUID) -> None:
-        super().__init__(f"{resource} not found: {ident}")
-        self.resource = resource
-        self.ident = str(ident)
-
-
-class ToolError(AppError):
-    def __init__(self, tool_name: str, message: str) -> None:
-        super().__init__(f"tool '{tool_name}' failed: {message}")
-        self.tool_name = tool_name
-
-
-class GuardrailViolation(AppError):
-    def __init__(self, reason: str) -> None:
-        super().__init__(f"guardrail blocked: {reason}")
-        self.reason = reason
-
-
-class BudgetExceeded(AppError):
-    def __init__(self, kind: str, limit: int) -> None:
-        super().__init__(f"{kind} budget exceeded (limit={limit})")
-        self.kind = kind
-        self.limit = limit

@@ -1,4 +1,4 @@
-"""All ORM tables in one file. AgentDB/WorkflowDB store the full Pydantic config
+"""All ORM tables in one file. AgentDB stores the full Pydantic config
 as JSON — queryable columns are only the bits the API/UI sort or filter on."""
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 from fastapi_users_db_sqlalchemy import SQLAlchemyBaseUserTableUUID
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, Uuid
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -19,6 +19,8 @@ class UserDB(SQLAlchemyBaseUserTableUUID, Base):
 
     name: Mapped[str] = mapped_column(String(120), default="")
     slack_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True, index=True)
+    # "free" | "paid" | "admin" — controls auto-seeded keys and rate limits
+    plan: Mapped[str] = mapped_column(String(20), default="free", server_default="free")
 
 
 class AgentDB(Base):
@@ -32,24 +34,10 @@ class AgentDB(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
-class WorkflowDB(Base):
-    __tablename__ = "workflows"
-
-    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
-    # Null user_id = global template (seeded). Real workflows have user_id.
-    user_id: Mapped[UUID | None] = mapped_column(
-        Uuid, ForeignKey("user.id", ondelete="CASCADE"), index=True, nullable=True
-    )
-    name: Mapped[str] = mapped_column(String(120))
-    is_template: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
-    definition: Mapped[dict] = mapped_column(JSON)  # full WorkflowDef dump
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
-
 
 class PersonaDB(Base):
     """Named system_prompt. user_id IS NULL = global (visible to all, read-only).
-    Otherwise owned by that user. Same pattern as workflow templates."""
+    Otherwise owned by that user."""
 
     __tablename__ = "personas"
 
@@ -61,12 +49,58 @@ class PersonaDB(Base):
     system_prompt: Mapped[str] = mapped_column(Text)
 
 
+class SkillDB(Base):
+    """Reusable knowledge/instruction document. Injected into agent system_prompt at runtime.
+    user_id IS NULL = global (read-only). Same ownership pattern as PersonaDB."""
+
+    __tablename__ = "skills"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    user_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("user.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    name: Mapped[str] = mapped_column(String(120))
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class UserToolConfigDB(Base):
+    """Per-user, per-tool credentials (e.g. Tavily API key). Composite unique on (user_id, tool_name)."""
+
+    __tablename__ = "user_tool_configs"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("user.id", ondelete="CASCADE"), index=True)
+    tool_name: Mapped[str] = mapped_column(String(120))
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class MCPServerDB(Base):
+    """Registered MCP server connection. Tools discovered at runtime via GET /mcp-servers/{id}/tools."""
+
+    __tablename__ = "mcp_servers"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("user.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    url: Mapped[str] = mapped_column(String(500))
+    transport: Mapped[str] = mapped_column(String(20), default="http")
+    headers: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class ChatDB(Base):
     __tablename__ = "chats"
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
     user_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("user.id", ondelete="CASCADE"), index=True)
-    agent_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    agent_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     persona_id: Mapped[UUID | None] = mapped_column(
         Uuid, ForeignKey("personas.id", ondelete="SET NULL"), nullable=True
     )
@@ -87,9 +121,6 @@ class RunDB(Base):
     chat_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("chats.id", ondelete="CASCADE"), index=True)
     agent_id: Mapped[UUID | None] = mapped_column(
         Uuid, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True
-    )
-    workflow_id: Mapped[UUID | None] = mapped_column(
-        Uuid, ForeignKey("workflows.id", ondelete="SET NULL"), nullable=True
     )
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)

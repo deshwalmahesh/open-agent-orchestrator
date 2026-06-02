@@ -1,10 +1,23 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ca-postgres
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent
+      POSTGRES_DB: agent
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   redis:
-    image: redis:7-alpine
+    image: redis/redis-stack-server:latest
     container_name: ca-redis
-    command: ["redis-server", "--appendonly", "yes"]
-    ports:
-      - "6379:6379"
     volumes:
       - redis_data:/data
     restart: unless-stopped
@@ -17,16 +30,20 @@ services:
   backend:
     build:
       context: ./backend
-    image: configurable-agent-backend:dev
     container_name: ca-backend
+    command: ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     env_file:
-      - ./backend/.env
+      - .env
     environment:
-      # Inside the compose network, redis is reachable at host "redis".
+      DATABASE_URL: postgresql+asyncpg://agent:agent@postgres:5432/agent
       REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
+    volumes:
+      - ./backend/app:/app/app
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
     restart: unless-stopped
@@ -35,7 +52,37 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
-      start_period: 10s
+      start_period: 15s
+
+  mcp-sample:
+    build:
+      context: ./backend
+    container_name: ca-mcp-sample
+    command: ["uv", "run", "python", "-m", "app.integrations.sample_mcp_server"]
+    volumes:
+      - ./backend/app:/app/app
+    restart: unless-stopped
+
+  frontend:
+    image: node:20-alpine
+    container_name: ca-frontend
+    working_dir: /app
+    command: ["sh", "-c", "npm install && npm run dev -- --host 0.0.0.0 --port 80"]
+    environment:
+      # Browser code uses /api (relative) → Vite proxy forwards to API_BACKEND_URL
+      VITE_API_URL: /api
+      API_BACKEND_URL: http://backend:8000
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "${PORT:-80}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
+  pg_data:
   redis_data:
+  frontend_node_modules:

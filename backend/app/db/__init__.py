@@ -41,7 +41,15 @@ async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
 
 async def create_all() -> None:
     """Idempotent schema bootstrap — no Alembic in v1; prod swaps in migrations."""
+    from sqlalchemy import text
+
     from app.db import models  # noqa: F401 — register tables with Base.metadata
     log.info("db.create_all", url=get_settings().database_url)
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Inline column migration: safe no-op if column already exists (new installs).
+        # Existing DBs get the column with the server default applied to all rows.
+        try:
+            await conn.execute(text("ALTER TABLE \"user\" ADD COLUMN plan VARCHAR(20) NOT NULL DEFAULT 'free'"))
+        except Exception:
+            pass

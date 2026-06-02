@@ -1,4 +1,4 @@
-"""Chat CRUD — cross-ref ownership validated at create time; no PATCH."""
+"""Chat CRUD — cross-ref ownership validated at create time; PATCH for agent reassignment."""
 from __future__ import annotations
 
 from uuid import uuid4
@@ -113,13 +113,17 @@ def test_delete_chat_404_cross_user(client, signup_and_login, auth_header, sampl
     assert client.delete(f"/chats/{chat_id}", headers=auth_header(bob)).status_code == 404
 
 
-def test_no_patch_endpoint(client, signup_and_login, auth_header, sample_agent_config):
-    """Chats are immutable post-create in v1 — only create/list/get/delete."""
+def test_patch_reassign_agent(client, signup_and_login, auth_header, sample_agent_config):
+    """PATCH /chats/{id} can reassign agent_id to a different owned agent."""
     token = signup_and_login()
     h = auth_header(token)
-    agent_id = _create_agent(client, token, auth_header, sample_agent_config)
-    chat_id = client.post("/chats", json={"agent_id": agent_id}, headers=h).json()["id"]
-    assert client.patch(f"/chats/{chat_id}", json={"title": "x"}, headers=h).status_code == 405
+    agent_a = _create_agent(client, token, auth_header, sample_agent_config, "AgentA")
+    agent_b = _create_agent(client, token, auth_header, sample_agent_config, "AgentB")
+    chat_id = client.post("/chats", json={"agent_id": agent_a}, headers=h).json()["id"]
+
+    r = client.patch(f"/chats/{chat_id}", json={"agent_id": agent_b}, headers=h)
+    assert r.status_code == 200
+    assert r.json()["agent_id"] == agent_b
 
 
 def test_all_endpoints_require_auth(client):

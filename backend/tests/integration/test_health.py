@@ -1,10 +1,9 @@
-from fastapi.testclient import TestClient
+def test_health_returns_ok(client):
+    assert client.get("/health").json() == {"status": "ok"}
 
-from app.main import app
 
-
-def test_health_returns_ok() -> None:
-    client = TestClient(app)
-    resp = client.get("/health")
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+def test_tools_returns_list(client):
+    r = client.get("/tools")
+    assert r.status_code == 200
+    names = [t["name"] for t in r.json()]
+    assert "calculator" in names

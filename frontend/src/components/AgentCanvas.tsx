@@ -1,0 +1,1291 @@
+import { createContext, useCallback, useContext, useMemo, useState } from "react";
+import {
+  ReactFlow,
+  Background,
+  Controls,
+  type NodeTypes,
+  type NodeProps,
+  type Node,
+  type Edge,
+  Handle,
+  Position,
+} from "@xyflow/react";
+import dagre from "@dagrejs/dagre";
+import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { Sheet, SheetContent } from "@/components/ui/sheet";
+import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import AgentForm from "@/components/AgentForm";
+import { updateAgent, createAgent as apiCreateAgent } from "@/api/agents";
+import { listTools } from "@/api/tools";
+import { listMCPServers, discoverMCPTools, createMCPServer } from "@/api/mcp-servers";
+import { listToolConfigs, upsertToolConfig, validateToolConfig } from "@/api/tool-configs";
+import { listPersonas } from "@/api/personas";
+import { useAuth } from "@/hooks/useAuth";
+import { cn } from "@/lib/utils";
+import type { Agent, AgentConfig, MCPServer } from "@/types";
+import "@xyflow/react/dist/style.css";
+
+// ─── Tool credential fields ───────────────────────────────────────────────────
+const TOOL_FIELDS: Record<string, Array<{ key: string; label: string; placeholder: string; required: boolean }>> = {
+  web_search: [{ key: "api_key", label: "Tavily API Key", placeholder: "tvly-xxxxxxxxxxxxxxxx", required: true }],
+};
+
+const TOOL_META: Record<string, { emoji: string }> = {
+  web_search:       { emoji: "🔍" },
+  calculator:       { emoji: "🧮" },
+  html_to_markdown: { emoji: "📄" },
+  pdf_to_text:      { emoji: "📑" },
+  python_sandbox:   { emoji: "🐍" },
+};
+
+const PROVIDERS = [
+  { label: "OpenAI",       url: "https://api.openai.com/v1" },
+  { label: "Anthropic",    url: "https://api.anthropic.com/v1" },
+  { label: "vLLM (local)", url: "http://localhost:8000/v1" },
+  { label: "LiteLLM",     url: "http://localhost:4000" },
+  { label: "Custom",       url: "" },
+];
+
+// ─── State types ──────────────────────────────────────────────────────────────
+type ToolConfigDlg = {
+  toolName: string;
+  sourceAgentId: string;
+  configValues: Record<string, string>;
+  testState: "idle" | "testing" | "ok" | "fail";
+  testError?: string;
+};
+
+type CreateAgentForm = {
+  name: string;
+  provider: string;
+  base_url: string;
+  api_key: string;
+  model: string;
+  personaMode: "new" | "select";
+  personaId: string;
+  systemPrompt: string;
+};
+
+const DEFAULT_AGENT_FORM: CreateAgentForm = {
+  name: "",
+  provider: "OpenAI",
+  base_url: "https://api.openai.com/v1",
+  api_key: "",
+  model: "",
+  personaMode: "new",
+  personaId: "",
+  systemPrompt: "You are a helpful assistant.",
+};
+
+// ─── Layout: 3-tier waterfall (top=supervisor, mid=internal, bottom=external) ──
+function layoutNodes(nodes: Node[], edges: Edge[]): Node[] {
+  const g = new dagre.graphlib.Graph();
+  g.setDefaultEdgeLabel(() => ({}));
+  g.setGraph({ rankdir: "TB", ranksep: 80, nodesep: 28 });
+  nodes.forEach((n) => {
+    const w = n.type === "tool" || n.type === "mcp" ? 160 : 204;
+    g.setNode(n.id, { width: w, height: 76 });
+  });
+  const internal = edges.filter((e) => !e.id.includes("mcp::"));
+  const external = edges.filter((e) => e.id.includes("mcp::"));
+  [...internal, ...external].forEach((e) => g.setEdge(e.source, e.target));
+  dagre.layout(g);
+
+  const laidOut = nodes.map((n) => {
+    const pos = g.node(n.id);
+    const w = n.type === "tool" || n.type === "mcp" ? 160 : 204;
+    return { ...n, position: { x: pos.x - w / 2, y: pos.y - 38 } };
+  });
+
+  const root = laidOut.find((n) => n.type === "main-agent");
+  if (!root) return laidOut;
+  const dx = -root.position.x;
+  const dy = -root.position.y;
+  return laidOut.map((n) => ({ ...n, position: { x: n.position.x + dx, y: n.position.y + dy } }));
+}
+
+// ─── Invisible handle ─────────────────────────────────────────────────────────
+function H({ type, pos }: { type: "source" | "target"; pos: Position }) {
+  return (
+    <Handle
+      type={type}
+      position={pos}
+      style={{ opacity: 0, width: 4, height: 4, background: "transparent", border: "none" }}
+    />
+  );
+}
+
+// ─── Canvas context ───────────────────────────────────────────────────────────
+type PropsTarget =
+  | { kind: "root-agent" | "sub-agent"; agentId: string }
+  | { kind: "tool"; toolName: string; ownerAgentId: string; description: string }
+  | { kind: "mcp"; serverId: string; serverName: string };
+
+interface CanvasCtx {
+  onAdd: (sourceAgentId: string, isRoot: boolean) => void;
+  onProps: (t: PropsTarget) => void;
+  onRemoveTool: (toolName: string, ownerAgentId: string) => void;
+  onRemoveAgent: (subAgentId: string) => void;
+  onRemoveMCP: (serverId: string) => void;
+}
+
+const Ctx = createContext<CanvasCtx | null>(null);
+function useCtx(): CanvasCtx { return useContext(Ctx)!; }
+
+// ─── Main agent node (violet) ──────────────────────────────────────────────────
+function MainNode({ id, data, selected }: NodeProps) {
+  const { onAdd, onProps } = useCtx();
+  return (
+    <div
+      className={cn(
+        "group relative rounded-2xl border-2 shadow-sm transition-all duration-150 w-[220px] cursor-pointer",
+        selected
+          ? "border-violet-400 bg-violet-50 shadow-lg shadow-violet-100"
+          : "border-violet-200 bg-violet-50/70 hover:border-violet-300 hover:shadow hover:bg-violet-50",
+      )}
+      onDoubleClick={(e) => { e.stopPropagation(); onProps({ kind: "root-agent", agentId: id }); }}
+      onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onProps({ kind: "root-agent", agentId: id }); }}
+    >
+      <div className="absolute inset-y-0 left-0 w-1.5 rounded-l-2xl bg-violet-500" />
+      <div className="pl-4 pr-3 py-3">
+        <p className="text-[9px] font-extrabold uppercase tracking-widest text-violet-500 mb-1">Supervisor</p>
+        <p className="font-semibold text-sm text-violet-900 truncate">{data.label as string}</p>
+        {(data.role as string) && <p className="text-[11px] text-violet-400 truncate mt-0.5">{data.role as string}</p>}
+        {(data.model as string) && <p className="text-[10px] text-violet-300 truncate mt-1 font-mono">{data.model as string}</p>}
+      </div>
+      <button
+        onClick={(e) => { e.stopPropagation(); onAdd(id, true); }}
+        className="nodrag nopan absolute -bottom-4 left-1/2 -translate-x-1/2 size-8 rounded-full bg-violet-500 hover:bg-violet-600 text-white text-lg font-bold flex items-center justify-center shadow-lg transition-all opacity-0 group-hover:opacity-100 scale-90 group-hover:scale-100"
+        title="Connect tool, MCP, or agent"
+      >+</button>
+      <H type="source" pos={Position.Bottom} />
+    </div>
+  );
+}
+
+// ─── Sub-agent node (blue) ────────────────────────────────────────────────────
+function SubAgentNode({ id, data, selected }: NodeProps) {
+  const { onAdd, onProps, onRemoveAgent } = useCtx();
+  return (
+    <div
+      className={cn(
+        "group relative rounded-2xl border-2 shadow-sm transition-all duration-150 w-[204px] cursor-pointer",
+        selected
+          ? "border-blue-400 bg-blue-50 shadow-lg shadow-blue-100"
+          : "border-blue-200 bg-blue-50/70 hover:border-blue-300 hover:shadow hover:bg-blue-50",
+      )}
+      onDoubleClick={(e) => { e.stopPropagation(); onProps({ kind: "sub-agent", agentId: id }); }}
+      onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onProps({ kind: "sub-agent", agentId: id }); }}
+    >
+      <div className="absolute inset-y-0 left-0 w-1.5 rounded-l-2xl bg-blue-500" />
+      <div className="pl-4 pr-3 py-3">
+        <p className="text-[9px] font-extrabold uppercase tracking-widest text-blue-500 mb-1">Agent · Internal</p>
+        <p className="font-semibold text-sm text-blue-900 truncate">{data.label as string}</p>
+        {(data.role as string) && <p className="text-[11px] text-blue-400 truncate mt-0.5">{data.role as string}</p>}
+      </div>
+      {selected && (
+        <div className="absolute -bottom-8 left-0 right-0 flex justify-center z-10">
+          <button
+            onClick={(e) => { e.stopPropagation(); onRemoveAgent(id); }}
+            className="nodrag nopan bg-white border border-red-200 text-red-500 rounded-lg px-3 py-1 text-xs hover:bg-red-50 shadow-sm font-medium"
+          >✕ Disconnect</button>
+        </div>
+      )}
+      <button
+        onClick={(e) => { e.stopPropagation(); onAdd(id, false); }}
+        className="nodrag nopan absolute -bottom-4 left-1/2 -translate-x-1/2 size-8 rounded-full bg-blue-500 hover:bg-blue-600 text-white text-lg font-bold flex items-center justify-center shadow-lg transition-all opacity-0 group-hover:opacity-100 scale-90 group-hover:scale-100"
+        title="Add tool to this agent"
+      >+</button>
+      <H type="target" pos={Position.Top} />
+      <H type="source" pos={Position.Bottom} />
+    </div>
+  );
+}
+
+// ─── Tool node (emerald) ──────────────────────────────────────────────────────
+function ToolNode({ data, selected }: NodeProps) {
+  const { onProps, onRemoveTool } = useCtx();
+  const toolName = data.toolName as string;
+  const meta = TOOL_META[toolName] ?? { emoji: "🔧" };
+  return (
+    <div
+      className={cn(
+        "group relative rounded-2xl border-2 shadow-sm transition-all duration-150 w-[160px] cursor-pointer",
+        selected
+          ? "border-emerald-400 bg-emerald-50 shadow-lg shadow-emerald-100"
+          : "border-emerald-200 bg-emerald-50/70 hover:border-emerald-300 hover:shadow hover:bg-emerald-50",
+      )}
+      onDoubleClick={(e) => { e.stopPropagation(); onProps({ kind: "tool", toolName, ownerAgentId: data.ownerAgentId as string, description: data.description as string }); }}
+      onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onProps({ kind: "tool", toolName, ownerAgentId: data.ownerAgentId as string, description: data.description as string }); }}
+    >
+      <div className="absolute inset-y-0 left-0 w-1.5 rounded-l-2xl bg-emerald-500" />
+      <div className="pl-4 pr-3 py-3">
+        <p className="text-[9px] font-extrabold uppercase tracking-widest text-emerald-500 mb-1">Tool · Internal</p>
+        <div className="flex items-center gap-2">
+          <span>{meta.emoji}</span>
+          <p className="font-semibold text-sm text-emerald-900 truncate">{toolName}</p>
+        </div>
+      </div>
+      {selected && (
+        <div className="absolute -bottom-8 left-0 right-0 flex justify-center z-10">
+          <button
+            onClick={(e) => { e.stopPropagation(); onRemoveTool(toolName, data.ownerAgentId as string); }}
+            className="nodrag nopan bg-white border border-red-200 text-red-500 rounded-lg px-3 py-1 text-xs hover:bg-red-50 shadow-sm font-medium"
+          >✕ Remove</button>
+        </div>
+      )}
+      <H type="target" pos={Position.Top} />
+    </div>
+  );
+}
+
+// ─── MCP node (amber) ─────────────────────────────────────────────────────────
+function MCPNode({ data, selected }: NodeProps) {
+  const { onProps, onRemoveMCP } = useCtx();
+  const serverId = data.serverId as string;
+  const tools = data.tools as string[];
+  return (
+    <div
+      className={cn(
+        "group relative rounded-2xl border-2 shadow-sm transition-all duration-150 w-[160px] cursor-pointer",
+        selected
+          ? "border-amber-400 bg-amber-50 shadow-lg shadow-amber-100"
+          : "border-amber-200 bg-amber-50/70 hover:border-amber-300 hover:shadow hover:bg-amber-50",
+      )}
+      onDoubleClick={(e) => { e.stopPropagation(); onProps({ kind: "mcp", serverId, serverName: data.label as string }); }}
+      onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onProps({ kind: "mcp", serverId, serverName: data.label as string }); }}
+    >
+      <div className="absolute inset-y-0 left-0 w-1.5 rounded-l-2xl bg-amber-500" />
+      <div className="pl-4 pr-3 py-3">
+        <p className="text-[9px] font-extrabold uppercase tracking-widest text-amber-500 mb-1">MCP · External</p>
+        <p className="font-semibold text-sm text-amber-900 truncate">🔌 {data.label as string}</p>
+        <p className="text-[11px] text-amber-400 mt-0.5">{tools.length} tool{tools.length !== 1 ? "s" : ""}</p>
+      </div>
+      {selected && (
+        <div className="absolute -bottom-8 left-0 right-0 flex justify-center z-10">
+          <button
+            onClick={(e) => { e.stopPropagation(); onRemoveMCP(serverId); }}
+            className="nodrag nopan bg-white border border-red-200 text-red-500 rounded-lg px-3 py-1 text-xs hover:bg-red-50 shadow-sm font-medium"
+          >✕ Disconnect</button>
+        </div>
+      )}
+      <H type="target" pos={Position.Top} />
+    </div>
+  );
+}
+
+const nodeTypes: NodeTypes = {
+  "main-agent": MainNode,
+  "sub-agent": SubAgentNode,
+  tool: ToolNode,
+  mcp: MCPNode,
+};
+
+// ─── Cache patch ──────────────────────────────────────────────────────────────
+function patchAgent(qc: QueryClient, agentId: string, config: AgentConfig) {
+  qc.setQueryData<Agent>(["agent", agentId], (p) => p ? { ...p, config } : p);
+  qc.setQueryData<Agent[]>(["agents"], (p) => p?.map((a) => a.id === agentId ? { ...a, config } : a));
+}
+
+// ─── Section header component ─────────────────────────────────────────────────
+function SectionHeader({ label, color, count }: { label: string; color: string; count?: number }) {
+  return (
+    <div className={cn("flex items-center gap-2 px-3 py-2 rounded-lg mb-2", color)}>
+      <span className="text-xs font-bold uppercase tracking-wider">{label}</span>
+      {count !== undefined && (
+        <span className="ml-auto text-xs opacity-70">{count}</span>
+      )}
+    </div>
+  );
+}
+
+// ─── Main component ────────────────────────────────────────────────────────────
+interface Props { agent: Agent; allAgents: Agent[] }
+
+export default function AgentCanvas({ agent, allAgents }: Props) {
+  const { token } = useAuth();
+  const qc = useQueryClient();
+
+  // ── Panel / dialog state ───────────────────────────────────────────────────
+  // Left panel — opens when "+" is clicked on a node
+  const [addPanel, setAddPanel] = useState<{ sourceAgentId: string; isRoot: boolean } | null>(null);
+  // Small dialog for tool API key config + validation
+  const [toolConfigDlg, setToolConfigDlg] = useState<ToolConfigDlg | null>(null);
+  // Right sheet — opens on double-click or right-click of a node
+  const [propsTarget, setPropsTarget] = useState<PropsTarget | null>(null);
+  const [editSubmitting, setEditSubmitting] = useState(false);
+
+  // Inline agent creation (inside left panel's Agents section)
+  const [agentCreateOpen, setAgentCreateOpen] = useState(false);
+  const [agentForm, setAgentForm] = useState<CreateAgentForm>(DEFAULT_AGENT_FORM);
+  const [creatingAgent, setCreatingAgent] = useState(false);
+
+  // Inline MCP registration (inside left panel's MCP section)
+  const [mcpRegOpen, setMcpRegOpen] = useState(false);
+  const [mcpRegForm, setMcpRegForm] = useState({ name: "", url: "", transport: "http" as "http" | "sse" });
+  const [mcpRegState, setMcpRegState] = useState<"idle" | "saving" | "fail">("idle");
+  const [mcpRegError, setMcpRegError] = useState("");
+
+  // ── Data queries ──────────────────────────────────────────────────────────
+  const { data: registryTools = [] } = useQuery({ queryKey: ["tools"], queryFn: listTools });
+  const { data: mcpServers = [] } = useQuery({
+    queryKey: ["mcp-servers"],
+    queryFn: () => listMCPServers(token!),
+    enabled: !!token,
+  });
+  const { data: toolConfigs = [] } = useQuery({
+    queryKey: ["tool-configs"],
+    queryFn: () => listToolConfigs(token!),
+    enabled: !!token,
+  });
+  const { data: personas = [] } = useQuery({
+    queryKey: ["personas"],
+    queryFn: () => listPersonas(token!),
+    enabled: !!token,
+    staleTime: 60_000,
+  });
+
+  // Discover tools from ALL registered MCP servers in parallel
+  const { data: mcpToolsMap = {} } = useQuery({
+    queryKey: ["mcp-tools", mcpServers.map((s) => s.id).join(",")],
+    queryFn: async () => {
+      const settled = await Promise.allSettled(
+        mcpServers.map((s) =>
+          discoverMCPTools(token!, s.id).then((tools) => ({ server: s, tools })),
+        ),
+      );
+      const result: Record<string, { server: MCPServer; tools: Array<{ name: string; description: string }> }> = {};
+      settled.forEach((r) => {
+        if (r.status === "fulfilled") result[r.value.server.id] = r.value;
+      });
+      return result;
+    },
+    enabled: !!token && mcpServers.length > 0,
+    staleTime: 30_000,
+  });
+
+  const configuredTools = useMemo(
+    () => new Set(toolConfigs.map((tc) => tc.tool_name)),
+    [toolConfigs],
+  );
+
+  // ── Mutations ─────────────────────────────────────────────────────────────
+  const addTool = useCallback(async (toolName: string, agentId: string) => {
+    const target = agentId === agent.id ? agent : allAgents.find((a) => a.id === agentId) ?? agent;
+    if (target.config.tools.includes(toolName)) return;
+    const updated: AgentConfig = { ...target.config, tools: [...target.config.tools, toolName] };
+    patchAgent(qc, agentId, updated);
+    setAddPanel(null);
+    try {
+      await updateAgent(token!, agentId, updated);
+    } catch (e) {
+      console.error("Failed to add tool:", e);
+      await qc.invalidateQueries({ queryKey: ["agents"] });
+    }
+  }, [agent, allAgents, token, qc]);
+
+  const removeTool = useCallback(async (toolName: string, agentId: string) => {
+    const target = agentId === agent.id ? agent : allAgents.find((a) => a.id === agentId) ?? agent;
+    const updated: AgentConfig = { ...target.config, tools: target.config.tools.filter((t) => t !== toolName) };
+    patchAgent(qc, agentId, updated);
+    setPropsTarget(null);
+    try {
+      await updateAgent(token!, agentId, updated);
+    } catch (e) {
+      console.error("Failed to remove tool:", e);
+      await qc.invalidateQueries({ queryKey: ["agents"] });
+    }
+  }, [agent, allAgents, token, qc]);
+
+  const addSubagent = useCallback(async (subId: string) => {
+    if (agent.config.subagents.includes(subId)) return;
+    const updated: AgentConfig = { ...agent.config, subagents: [...agent.config.subagents, subId] };
+    patchAgent(qc, agent.id, updated);
+    setAddPanel(null);
+    try {
+      await updateAgent(token!, agent.id, updated);
+    } catch (e) {
+      console.error("Failed to add sub-agent:", e);
+      await qc.invalidateQueries({ queryKey: ["agents"] });
+    }
+  }, [agent, token, qc]);
+
+  const removeSubagent = useCallback(async (subId: string) => {
+    const updated: AgentConfig = { ...agent.config, subagents: agent.config.subagents.filter((id) => id !== subId) };
+    patchAgent(qc, agent.id, updated);
+    setPropsTarget(null);
+    try {
+      await updateAgent(token!, agent.id, updated);
+    } catch (e) {
+      console.error("Failed to remove sub-agent:", e);
+      await qc.invalidateQueries({ queryKey: ["agents"] });
+    }
+  }, [agent, token, qc]);
+
+  const addMCPServer = useCallback(async (serverId: string) => {
+    if (agent.config.mcp_servers.includes(serverId)) return;
+    const updated: AgentConfig = { ...agent.config, mcp_servers: [...agent.config.mcp_servers, serverId] };
+    patchAgent(qc, agent.id, updated);
+    try {
+      await updateAgent(token!, agent.id, updated);
+    } catch (e) {
+      console.error("Failed to add MCP server:", e);
+      await qc.invalidateQueries({ queryKey: ["agents"] });
+    }
+  }, [agent, token, qc]);
+
+  const removeMCPServer = useCallback(async (serverId: string) => {
+    const updated: AgentConfig = { ...agent.config, mcp_servers: agent.config.mcp_servers.filter((id) => id !== serverId) };
+    patchAgent(qc, agent.id, updated);
+    setPropsTarget(null);
+    try {
+      await updateAgent(token!, agent.id, updated);
+    } catch (e) {
+      console.error("Failed to remove MCP server:", e);
+      await qc.invalidateQueries({ queryKey: ["agents"] });
+    }
+  }, [agent, token, qc]);
+
+  // ── Context ───────────────────────────────────────────────────────────────
+  const onAdd = useCallback((sourceAgentId: string, isRoot: boolean) => {
+    setAddPanel({ sourceAgentId, isRoot });
+    setAgentCreateOpen(false);
+    setMcpRegOpen(false);
+    setMcpRegState("idle");
+  }, []);
+  const onProps = useCallback((t: PropsTarget) => setPropsTarget(t), []);
+  const onRemoveTool = useCallback((n: string, owner: string) => removeTool(n, owner), [removeTool]);
+  const onRemoveAgent = useCallback((id: string) => removeSubagent(id), [removeSubagent]);
+  const onRemoveMCP = useCallback((id: string) => removeMCPServer(id), [removeMCPServer]);
+  const ctx = useMemo<CanvasCtx>(
+    () => ({ onAdd, onProps, onRemoveTool, onRemoveAgent, onRemoveMCP }),
+    [onAdd, onProps, onRemoveTool, onRemoveAgent, onRemoveMCP],
+  );
+
+  // ── Graph ─────────────────────────────────────────────────────────────────
+  const toolDescMap = useMemo(
+    () => Object.fromEntries(registryTools.map((t) => [t.name, t.description])),
+    [registryTools],
+  );
+
+  const { nodes, edges } = useMemo(() => {
+    const ns: Node[] = [];
+    const es: Edge[] = [];
+
+    ns.push({
+      id: agent.id,
+      type: "main-agent",
+      data: {
+        label: agent.name,
+        role: agent.config.role,
+        model: agent.config.llm.model || null,
+      },
+      position: { x: 0, y: 0 },
+    });
+
+    agent.config.tools.forEach((toolName) => {
+      const nid = `${agent.id}::${toolName}`;
+      ns.push({ id: nid, type: "tool", data: { label: toolName, toolName, ownerAgentId: agent.id, description: toolDescMap[toolName] ?? "" }, position: { x: 0, y: 0 } });
+      es.push({ id: `e:${agent.id}->${nid}`, source: agent.id, target: nid, style: { stroke: "#10b981", strokeWidth: 2 } });
+    });
+
+    agent.config.subagents.forEach((subId) => {
+      const sub = allAgents.find((a) => a.id === subId);
+      if (!sub) return;
+      ns.push({ id: sub.id, type: "sub-agent", data: { label: sub.name, role: sub.config.role }, position: { x: 0, y: 0 } });
+      es.push({ id: `e:${agent.id}->${sub.id}`, source: agent.id, target: sub.id, style: { stroke: "#3b82f6", strokeWidth: 2 } });
+      sub.config.tools.forEach((toolName) => {
+        const nid = `${sub.id}::${toolName}`;
+        ns.push({ id: nid, type: "tool", data: { label: toolName, toolName, ownerAgentId: sub.id, description: toolDescMap[toolName] ?? "" }, position: { x: 0, y: 0 } });
+        es.push({ id: `e:${sub.id}->${nid}`, source: sub.id, target: nid, style: { stroke: "#10b981", strokeWidth: 2 } });
+      });
+      sub.config.mcp_servers.forEach((serverId) => {
+        const server = mcpServers.find((s) => s.id === serverId);
+        if (!server) return;
+        const tools = mcpToolsMap[serverId]?.tools.map((t) => t.name) ?? [];
+        const nid = `mcp::${sub.id}::${serverId}`;
+        ns.push({ id: nid, type: "mcp", data: { label: server.name, serverId, tools }, position: { x: 0, y: 0 } });
+        es.push({ id: `e:${sub.id}->${nid}`, source: sub.id, target: nid, style: { stroke: "#f59e0b", strokeWidth: 2, strokeDasharray: "6,3" } });
+      });
+    });
+
+    agent.config.mcp_servers.forEach((serverId) => {
+      const server = mcpServers.find((s) => s.id === serverId);
+      if (!server) return;
+      const tools = mcpToolsMap[serverId]?.tools.map((t) => t.name) ?? [];
+      const nid = `mcp::${serverId}`;
+      ns.push({ id: nid, type: "mcp", data: { label: server.name, serverId, tools }, position: { x: 0, y: 0 } });
+      es.push({ id: `e:${agent.id}->${nid}`, source: agent.id, target: nid, style: { stroke: "#f59e0b", strokeWidth: 2, strokeDasharray: "6,3" } });
+    });
+
+    return { nodes: layoutNodes(ns, es), edges: es };
+  }, [agent, allAgents, toolDescMap, mcpServers, mcpToolsMap]);
+
+  // ── Left panel: derived lists ──────────────────────────────────────────────
+  const panelConfig = addPanel
+    ? (addPanel.sourceAgentId === agent.id ? agent.config : allAgents.find((a) => a.id === addPanel.sourceAgentId)?.config ?? agent.config)
+    : null;
+  const panelTools = registryTools;
+  const panelAgents = allAgents.filter((a) => a.id !== agent.id);
+  const panelMCPServers = mcpServers;
+
+  // ── Tool config dialog handlers ────────────────────────────────────────────
+  function openToolConfig(toolName: string) {
+    if (!addPanel) return;
+    setToolConfigDlg({
+      toolName,
+      sourceAgentId: addPanel.sourceAgentId,
+      configValues: {},
+      testState: "idle",
+    });
+  }
+
+  function handleSelectTool(toolName: string) {
+    if (!addPanel) return;
+    const needsConfig = TOOL_FIELDS[toolName]?.length > 0;
+    if (needsConfig && !configuredTools.has(toolName)) {
+      openToolConfig(toolName);
+    } else {
+      addTool(toolName, addPanel.sourceAgentId);
+    }
+  }
+
+  async function handleTestToolConfig() {
+    if (!toolConfigDlg) return;
+    setToolConfigDlg((d) => d ? { ...d, testState: "testing", testError: undefined } : d);
+    try {
+      const res = await validateToolConfig(token!, toolConfigDlg.toolName, toolConfigDlg.configValues);
+      setToolConfigDlg((d) => d ? { ...d, testState: res.ok ? "ok" : "fail", testError: res.error } : d);
+    } catch {
+      setToolConfigDlg((d) => d ? { ...d, testState: "fail", testError: "Request failed" } : d);
+    }
+  }
+
+  async function handleSaveToolConfig() {
+    if (!toolConfigDlg || toolConfigDlg.testState !== "ok") return;
+    try {
+      await upsertToolConfig(token!, toolConfigDlg.toolName, toolConfigDlg.configValues);
+      await qc.invalidateQueries({ queryKey: ["tool-configs"] });
+      addTool(toolConfigDlg.toolName, toolConfigDlg.sourceAgentId);
+      setToolConfigDlg(null);
+    } catch (e) {
+      console.error("Failed to save tool config:", e);
+    }
+  }
+
+  // ── MCP registration handler ───────────────────────────────────────────────
+  async function handleRegisterMCP() {
+    if (!mcpRegForm.name.trim() || !mcpRegForm.url.trim()) return;
+    setMcpRegState("saving");
+    setMcpRegError("");
+    try {
+      const server = await createMCPServer(token!, {
+        name: mcpRegForm.name,
+        url: mcpRegForm.url,
+        transport: mcpRegForm.transport,
+      });
+      // Validate connection by discovering tools
+      await discoverMCPTools(token!, server.id);
+      // Auto-attach to current agent
+      await addMCPServer(server.id);
+      await qc.invalidateQueries({ queryKey: ["mcp-servers"] });
+      setMcpRegState("idle");
+      setMcpRegOpen(false);
+      setMcpRegForm({ name: "", url: "", transport: "http" });
+    } catch (e: unknown) {
+      setMcpRegState("fail");
+      setMcpRegError((e instanceof Error ? e.message : String(e)).slice(0, 150));
+    }
+  }
+
+  // ── Create new agent inline handler ───────────────────────────────────────
+  async function handleSubmitNewAgent() {
+    if (!agentForm.name.trim() || !agentForm.base_url.trim() || !agentForm.model.trim()) return;
+    setCreatingAgent(true);
+    try {
+      let systemPrompt = agentForm.systemPrompt;
+      if (agentForm.personaMode === "select" && agentForm.personaId) {
+        const p = personas.find((x) => x.id === agentForm.personaId);
+        systemPrompt = p?.system_prompt ?? systemPrompt;
+      }
+      const config: AgentConfig = {
+        name: agentForm.name,
+        role: "assistant",
+        description: null,
+        system_prompt: systemPrompt,
+        llm: {
+          base_url: agentForm.base_url,
+          api_key: agentForm.api_key || "EMPTY",
+          model: agentForm.model,
+          temperature: 0.7,
+          max_tokens: 1024,
+          timeout_s: 30.0,
+        },
+        tools: [],
+        memory: { type: "summary", window: 10, summary_threshold: 20 },
+        limits: { max_steps: 8, max_tokens_per_run: null },
+        guardrails: { blocked_topics: [], require_human_approval_for: [] },
+        subagents: [],
+        skills: [],
+        mcp_servers: [],
+        schedules: [],
+        channels: [],
+        metadata: {},
+      };
+      const newAgent = await apiCreateAgent(token!, config);
+      await qc.invalidateQueries({ queryKey: ["agents"] });
+      await addSubagent(newAgent.id);
+      setAgentCreateOpen(false);
+      setAgentForm(DEFAULT_AGENT_FORM);
+    } catch (e) {
+      console.error("Failed to create agent:", e);
+    } finally {
+      setCreatingAgent(false);
+    }
+  }
+
+  // ── Agent edit (Sheet) ────────────────────────────────────────────────────
+  const editAgent =
+    propsTarget?.kind === "root-agent" ? agent
+    : propsTarget?.kind === "sub-agent" ? allAgents.find((a) => a.id === (propsTarget as { agentId: string }).agentId) ?? null
+    : null;
+
+  async function handleEditSave(config: AgentConfig) {
+    if (!editAgent) return;
+    setEditSubmitting(true);
+    try {
+      await updateAgent(token!, editAgent.id, config);
+      await qc.invalidateQueries({ queryKey: ["agents"] });
+      await qc.invalidateQueries({ queryKey: ["agent", editAgent.id] });
+      setPropsTarget(null);
+    } catch (e) {
+      console.error("Agent save failed:", e);
+    } finally {
+      setEditSubmitting(false);
+    }
+  }
+
+  const isEmpty = nodes.length === 1;
+
+  return (
+    <Ctx.Provider value={ctx}>
+      <div className="w-full h-full relative">
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={nodeTypes}
+          fitView
+          fitViewOptions={{ padding: 0.35 }}
+          proOptions={{ hideAttribution: true }}
+          nodesConnectable={false}
+          edgesFocusable={false}
+          className="bg-[#f8f9fb]"
+        >
+          <Background color="#e2e8f0" gap={28} size={1.5} />
+          <Controls showInteractive={false} />
+        </ReactFlow>
+
+        {/* Empty state hint */}
+        {isEmpty && (
+          <div className="absolute inset-0 flex items-end justify-center pb-16 pointer-events-none">
+            <div className="bg-white/80 backdrop-blur-sm border border-violet-100 rounded-2xl px-6 py-4 text-center shadow-sm">
+              <p className="text-sm text-violet-600 font-medium">Hover the agent node and click <span className="bg-violet-100 rounded px-1 font-bold">+</span> to connect tools, sub-agents, or MCP servers</p>
+              <p className="text-xs text-muted-foreground mt-1">Double-click or right-click any node to edit its properties</p>
+            </div>
+          </div>
+        )}
+
+        {/* Legend */}
+        <div className="absolute top-3 right-3 bg-white/90 border border-gray-200 rounded-xl p-3 text-xs shadow-sm backdrop-blur-sm space-y-1.5">
+          <p className="font-bold text-[10px] uppercase tracking-wider text-gray-400 mb-2">Legend</p>
+          <div className="flex items-center gap-2"><span className="w-2.5 h-2.5 rounded bg-violet-500" />Supervisor</div>
+          <div className="flex items-center gap-2"><span className="w-2.5 h-2.5 rounded bg-blue-500" />Agent <span className="text-gray-400">(internal)</span></div>
+          <div className="flex items-center gap-2"><span className="w-2.5 h-2.5 rounded bg-emerald-500" />Tool <span className="text-gray-400">(internal)</span></div>
+          <div className="flex items-center gap-2"><span className="w-2.5 h-2.5 rounded bg-amber-500" />MCP <span className="text-gray-400">(external)</span></div>
+          <div className="mt-1.5 pt-1.5 border-t space-y-1">
+            <div className="flex items-center gap-2"><span className="w-6 border-t-2 border-emerald-400 inline-block" />Internal</div>
+            <div className="flex items-center gap-2"><span className="w-6 border-t-2 border-dashed border-amber-400 inline-block" />External</div>
+          </div>
+          <p className="text-gray-400 text-[10px] mt-1">Hover → + connect · Dbl-click → edit</p>
+        </div>
+
+        {/* ── Left panel (add connections) ────────────────────────────────── */}
+        {addPanel && (
+          <div className="absolute left-0 top-0 bottom-0 z-20 w-[300px] bg-white/95 backdrop-blur-md border-r border-gray-200 shadow-xl flex flex-col">
+            {/* Panel header */}
+            <div className="flex items-center gap-2 px-4 py-3 border-b bg-gradient-to-r from-violet-50 to-blue-50 shrink-0">
+              <p className="font-semibold text-sm flex-1">Connect to Agent</p>
+              <button
+                onClick={() => { setAddPanel(null); setAgentCreateOpen(false); setMcpRegOpen(false); }}
+                className="size-6 rounded-full hover:bg-gray-200 flex items-center justify-center text-gray-400 hover:text-gray-700 transition-colors"
+              >✕</button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-3 space-y-5">
+
+              {/* ── Agents section (root only) ────────────────────────────── */}
+              {addPanel.isRoot && (
+                <section>
+                  <SectionHeader label="🤖 Sub-Agents" color="bg-blue-50 text-blue-700" count={panelAgents.length} />
+
+                  {/* Create new agent inline */}
+                  {!agentCreateOpen ? (
+                    <button
+                      onClick={() => setAgentCreateOpen(true)}
+                      className="w-full mb-2 p-2.5 rounded-xl border-2 border-dashed border-blue-200 hover:border-blue-400 hover:bg-blue-50/50 text-blue-600 text-xs font-semibold transition-all"
+                    >+ Create New Agent</button>
+                  ) : (
+                    <div className="mb-3 p-3 rounded-xl border border-blue-200 bg-blue-50/30 space-y-2.5">
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="text-xs font-bold text-blue-700">New Agent</span>
+                        <button onClick={() => setAgentCreateOpen(false)} className="text-xs text-gray-400 hover:text-gray-600">✕</button>
+                      </div>
+
+                      <div>
+                        <Label className="text-[11px] text-gray-600">Name *</Label>
+                        <Input
+                          value={agentForm.name}
+                          onChange={(e) => setAgentForm((f) => ({ ...f, name: e.target.value }))}
+                          placeholder="Research Agent"
+                          className="mt-1 h-8 text-xs"
+                        />
+                      </div>
+
+                      <div>
+                        <Label className="text-[11px] text-gray-600">Provider</Label>
+                        <select
+                          value={agentForm.provider}
+                          onChange={(e) => {
+                            const p = PROVIDERS.find((x) => x.label === e.target.value);
+                            setAgentForm((f) => ({ ...f, provider: e.target.value, base_url: p?.url ?? "" }));
+                          }}
+                          className="mt-1 w-full h-8 border border-input rounded-md px-2 text-xs bg-background"
+                        >
+                          {PROVIDERS.map((p) => <option key={p.label} value={p.label}>{p.label}</option>)}
+                        </select>
+                      </div>
+
+                      <div>
+                        <Label className="text-[11px] text-gray-600">Base URL *</Label>
+                        <Input
+                          value={agentForm.base_url}
+                          onChange={(e) => setAgentForm((f) => ({ ...f, base_url: e.target.value }))}
+                          placeholder="https://api.openai.com/v1"
+                          className="mt-1 h-8 text-xs font-mono"
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <Label className="text-[11px] text-gray-600">Model *</Label>
+                          <Input
+                            value={agentForm.model}
+                            onChange={(e) => setAgentForm((f) => ({ ...f, model: e.target.value }))}
+                            placeholder="gpt-4o-mini"
+                            className="mt-1 h-8 text-xs"
+                          />
+                        </div>
+                        <div>
+                          <Label className="text-[11px] text-gray-600">API Key</Label>
+                          <Input
+                            type="password"
+                            value={agentForm.api_key}
+                            onChange={(e) => setAgentForm((f) => ({ ...f, api_key: e.target.value }))}
+                            placeholder="optional"
+                            className="mt-1 h-8 text-xs"
+                          />
+                        </div>
+                      </div>
+
+                      <div>
+                        <Label className="text-[11px] text-gray-600 block mb-1">System Prompt</Label>
+                        <div className="flex gap-1 mb-1.5">
+                          {(["new", "select"] as const).map((m) => (
+                            <button
+                              key={m}
+                              onClick={() => setAgentForm((f) => ({ ...f, personaMode: m }))}
+                              className={cn(
+                                "flex-1 py-1 rounded text-[11px] font-medium border transition-colors",
+                                agentForm.personaMode === m
+                                  ? "bg-blue-500 text-white border-blue-500"
+                                  : "border-gray-200 text-gray-500 hover:bg-gray-50",
+                              )}
+                              disabled={m === "select" && personas.length === 0}
+                            >
+                              {m === "new" ? "Write new" : `Use persona (${personas.length})`}
+                            </button>
+                          ))}
+                        </div>
+                        {agentForm.personaMode === "new" ? (
+                          <textarea
+                            value={agentForm.systemPrompt}
+                            onChange={(e) => setAgentForm((f) => ({ ...f, systemPrompt: e.target.value }))}
+                            rows={3}
+                            placeholder="You are a helpful assistant…"
+                            className="w-full border border-input rounded-md px-2.5 py-1.5 text-xs bg-background resize-none focus:outline-none focus:ring-1 focus:ring-blue-300"
+                          />
+                        ) : (
+                          <select
+                            value={agentForm.personaId}
+                            onChange={(e) => setAgentForm((f) => ({ ...f, personaId: e.target.value }))}
+                            className="w-full h-8 border border-input rounded-md px-2 text-xs bg-background"
+                          >
+                            <option value="">Select persona…</option>
+                            {personas.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                          </select>
+                        )}
+                      </div>
+
+                      <Button
+                        size="sm"
+                        className="w-full h-8 bg-blue-500 hover:bg-blue-600 text-white text-xs"
+                        onClick={handleSubmitNewAgent}
+                        disabled={
+                          creatingAgent ||
+                          !agentForm.name.trim() ||
+                          !agentForm.base_url.trim() ||
+                          !agentForm.model.trim() ||
+                          (agentForm.personaMode === "new" && !agentForm.systemPrompt.trim()) ||
+                          (agentForm.personaMode === "select" && !agentForm.personaId)
+                        }
+                      >
+                        {creatingAgent ? "Creating…" : "Create & Attach"}
+                      </Button>
+                    </div>
+                  )}
+
+                  {panelAgents.length === 0 && !agentCreateOpen && (
+                    <p className="text-xs text-muted-foreground text-center py-3">No other agents yet. Create one above.</p>
+                  )}
+                  {panelAgents.map((a) => {
+                    const attached = agent.config.subagents.includes(a.id);
+                    return (
+                      <button
+                        key={a.id}
+                        onClick={() => !attached && addSubagent(a.id)}
+                        disabled={attached}
+                        className={cn(
+                          "w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl border text-left transition-all mb-1.5",
+                          attached
+                            ? "border-blue-100 bg-blue-50/40 opacity-60 cursor-default"
+                            : "border-gray-100 hover:border-blue-200 hover:bg-blue-50/40 cursor-pointer",
+                        )}
+                      >
+                        <span className="text-base">🤖</span>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs font-semibold text-gray-900 truncate">{a.name}</p>
+                          <p className="text-[10px] text-gray-400 truncate">{a.config.role}</p>
+                        </div>
+                        {attached
+                          ? <span className="text-[10px] bg-blue-100 text-blue-600 rounded-full px-2 py-0.5 font-medium shrink-0">Attached</span>
+                          : <span className="text-gray-300 text-sm shrink-0">→</span>}
+                      </button>
+                    );
+                  })}
+                </section>
+              )}
+
+              {/* ── Internal tools section ─────────────────────────────────── */}
+              <section>
+                <SectionHeader label="🔧 Tools" color="bg-emerald-50 text-emerald-700" count={panelTools.length} />
+
+                {panelTools.length === 0 && (
+                  <p className="text-xs text-muted-foreground text-center py-3">No tools available.</p>
+                )}
+                {panelTools.map((tool) => {
+                  const meta = TOOL_META[tool.name] ?? { emoji: "🔧" };
+                  const attached = panelConfig?.tools.includes(tool.name) ?? false;
+                  const needsConfig = !!TOOL_FIELDS[tool.name]?.length;
+                  const isConfigured = configuredTools.has(tool.name);
+                  return (
+                    <button
+                      key={tool.name}
+                      onClick={() => !attached && handleSelectTool(tool.name)}
+                      disabled={attached}
+                      className={cn(
+                        "w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl border text-left transition-all mb-1.5",
+                        attached
+                          ? "border-emerald-100 bg-emerald-50/40 opacity-60 cursor-default"
+                          : "border-gray-100 hover:border-emerald-200 hover:bg-emerald-50/40 cursor-pointer",
+                      )}
+                    >
+                      <span className="text-base">{meta.emoji}</span>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-semibold text-gray-900">{tool.name}</p>
+                        <p className="text-[10px] text-gray-400 truncate">{tool.description}</p>
+                      </div>
+                      {attached
+                        ? <span className="text-[10px] bg-emerald-100 text-emerald-600 rounded-full px-2 py-0.5 font-medium shrink-0">Attached</span>
+                        : needsConfig && !isConfigured
+                          ? <span className="text-[10px] bg-amber-100 text-amber-600 rounded-full px-1.5 py-0.5 shrink-0">⚙️ Setup</span>
+                          : <span className="text-gray-300 text-sm shrink-0">→</span>}
+                    </button>
+                  );
+                })}
+              </section>
+
+              {/* ── MCP servers section ────────────────────────────────────── */}
+              <section>
+                <SectionHeader label="🔌 MCP Servers" color="bg-amber-50 text-amber-700" count={panelMCPServers.length} />
+
+                {/* Register new MCP inline form */}
+                {!mcpRegOpen ? (
+                  <button
+                    onClick={() => { setMcpRegOpen(true); setMcpRegState("idle"); setMcpRegError(""); }}
+                    className="w-full mb-2 p-2.5 rounded-xl border-2 border-dashed border-amber-200 hover:border-amber-400 hover:bg-amber-50/50 text-amber-600 text-xs font-semibold transition-all"
+                  >+ Register New MCP Server</button>
+                ) : (
+                  <div className="mb-3 p-3 rounded-xl border border-amber-200 bg-amber-50/30 space-y-2">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-xs font-bold text-amber-700">Register MCP Server</span>
+                      <button onClick={() => { setMcpRegOpen(false); setMcpRegState("idle"); }} className="text-xs text-gray-400 hover:text-gray-600">✕</button>
+                    </div>
+
+                    <div>
+                      <Label className="text-[11px] text-gray-600">Server Name *</Label>
+                      <Input
+                        value={mcpRegForm.name}
+                        onChange={(e) => setMcpRegForm((f) => ({ ...f, name: e.target.value }))}
+                        placeholder="My MCP Server"
+                        className="mt-1 h-8 text-xs"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-[11px] text-gray-600">URL *</Label>
+                      <Input
+                        value={mcpRegForm.url}
+                        onChange={(e) => setMcpRegForm((f) => ({ ...f, url: e.target.value }))}
+                        placeholder="http://localhost:3000/mcp"
+                        className="mt-1 h-8 text-xs font-mono"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-[11px] text-gray-600">Transport</Label>
+                      <select
+                        value={mcpRegForm.transport}
+                        onChange={(e) => setMcpRegForm((f) => ({ ...f, transport: e.target.value as "http" | "sse" }))}
+                        className="mt-1 w-full h-8 border border-input rounded-md px-2 text-xs bg-background"
+                      >
+                        <option value="http">HTTP</option>
+                        <option value="sse">SSE</option>
+                      </select>
+                    </div>
+
+                    {mcpRegState === "fail" && (
+                      <p className="text-[11px] text-red-500 bg-red-50 border border-red-200 rounded-lg p-2">✗ {mcpRegError || "Connection failed"}</p>
+                    )}
+
+                    <Button
+                      size="sm"
+                      className="w-full h-8 bg-amber-500 hover:bg-amber-600 text-white text-xs"
+                      onClick={handleRegisterMCP}
+                      disabled={mcpRegState === "saving" || !mcpRegForm.name.trim() || !mcpRegForm.url.trim()}
+                    >
+                      {mcpRegState === "saving" ? "Testing & Registering…" : "Register & Connect"}
+                    </Button>
+                  </div>
+                )}
+
+                {/* Existing servers as sub-groups */}
+                {panelMCPServers.length === 0 && !mcpRegOpen && (
+                  <p className="text-xs text-muted-foreground text-center py-3">No MCP servers registered.</p>
+                )}
+                {panelMCPServers.map((server) => {
+                  const attached = agent.config.mcp_servers.includes(server.id);
+                  const discovered = mcpToolsMap[server.id]?.tools ?? [];
+                  return (
+                    <div
+                      key={server.id}
+                      className={cn(
+                        "mb-2 rounded-xl border overflow-hidden",
+                        attached ? "border-amber-200 bg-amber-50/30" : "border-gray-100 bg-gray-50/50",
+                      )}
+                    >
+                      {/* Server header row */}
+                      <div className="flex items-center gap-2 px-3 py-2">
+                        <span className="text-sm">🔌</span>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs font-semibold text-gray-900 truncate">{server.name}</p>
+                          <p className="text-[10px] text-gray-400 truncate font-mono">{server.url}</p>
+                        </div>
+                        {attached
+                          ? <span className="text-[10px] bg-amber-100 text-amber-600 rounded-full px-2 py-0.5 font-medium shrink-0">Attached</span>
+                          : (
+                            <button
+                              onClick={() => addMCPServer(server.id)}
+                              className="text-[10px] bg-amber-500 hover:bg-amber-600 text-white rounded-full px-2 py-0.5 font-medium shrink-0 transition-colors"
+                            >Attach →</button>
+                          )}
+                      </div>
+                      {/* Discovered tools */}
+                      {discovered.length > 0 && (
+                        <div className="px-3 pb-2 flex flex-wrap gap-1">
+                          {discovered.slice(0, 6).map((t) => (
+                            <span key={t.name} className="text-[10px] bg-amber-100/60 text-amber-700 rounded px-1.5 py-0.5 font-mono">{t.name}</span>
+                          ))}
+                          {discovered.length > 6 && (
+                            <span className="text-[10px] text-amber-400">+{discovered.length - 6} more</span>
+                          )}
+                        </div>
+                      )}
+                      {discovered.length === 0 && (
+                        <p className="px-3 pb-2 text-[10px] text-gray-400">No tools discovered (server may be offline)</p>
+                      )}
+                    </div>
+                  );
+                })}
+              </section>
+
+            </div>
+          </div>
+        )}
+
+        {/* ── Tool config dialog (API key + validation) ────────────────────── */}
+        <Dialog open={!!toolConfigDlg} onOpenChange={(o) => !o && setToolConfigDlg(null)}>
+          <DialogContent className="max-w-sm">
+            {toolConfigDlg && (() => {
+              const fields = TOOL_FIELDS[toolConfigDlg.toolName] ?? [];
+              const meta = TOOL_META[toolConfigDlg.toolName] ?? { emoji: "🔧" };
+              const allFilled = fields.every((f) => !f.required || toolConfigDlg.configValues[f.key]?.trim());
+              return (
+                <>
+                  {/* Gradient header */}
+                  <div className="-mx-6 -mt-6 px-6 pt-5 pb-4 rounded-t-lg bg-gradient-to-br from-emerald-500 to-teal-600 mb-4">
+                    <div className="flex items-center gap-3">
+                      <span className="text-2xl">{meta.emoji}</span>
+                      <div>
+                        <p className="font-bold text-white text-base">{toolConfigDlg.toolName}</p>
+                        <p className="text-emerald-100 text-xs">Tool Configuration</p>
+                      </div>
+                    </div>
+                  </div>
+
+                  <p className="text-xs text-muted-foreground mb-3">
+                    Enter credentials below. Your keys are saved to your account and used at runtime — never shared.
+                  </p>
+
+                  <div className="space-y-3">
+                    {fields.map((field) => (
+                      <div key={field.key}>
+                        <Label className="text-xs font-semibold">
+                          {field.label}{field.required && <span className="text-red-400 ml-1">*</span>}
+                        </Label>
+                        <Input
+                          className="mt-1.5 font-mono text-sm"
+                          type="password"
+                          placeholder={field.placeholder}
+                          value={toolConfigDlg.configValues[field.key] ?? ""}
+                          onChange={(e) =>
+                            setToolConfigDlg((d) => d ? {
+                              ...d,
+                              configValues: { ...d.configValues, [field.key]: e.target.value },
+                              testState: "idle",
+                              testError: undefined,
+                            } : d)
+                          }
+                        />
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Test result banner */}
+                  {toolConfigDlg.testState === "ok" && (
+                    <div className="mt-3 flex items-center gap-2 p-2.5 bg-emerald-50 border border-emerald-200 rounded-lg text-xs text-emerald-700 font-medium">
+                      <span>✓</span> Connection verified — key is valid
+                    </div>
+                  )}
+                  {toolConfigDlg.testState === "fail" && (
+                    <div className="mt-3 p-2.5 bg-red-50 border border-red-200 rounded-lg text-xs text-red-600">
+                      ✗ {toolConfigDlg.testError || "Validation failed"}
+                    </div>
+                  )}
+
+                  <div className="flex gap-2 mt-4">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setToolConfigDlg(null)}
+                      className="flex-none"
+                    >Cancel</Button>
+
+                    {toolConfigDlg.testState !== "ok" && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleTestToolConfig}
+                        disabled={toolConfigDlg.testState === "testing" || !allFilled}
+                        className="flex-1 border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+                      >
+                        {toolConfigDlg.testState === "testing" ? "Testing…" : "Test Connection"}
+                      </Button>
+                    )}
+
+                    <Button
+                      size="sm"
+                      onClick={handleSaveToolConfig}
+                      disabled={toolConfigDlg.testState !== "ok"}
+                      className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white"
+                    >
+                      Save & Add
+                    </Button>
+                  </div>
+                </>
+              );
+            })()}
+          </DialogContent>
+        </Dialog>
+
+        {/* ── Properties / Edit sheet (right side) ────────────────────────── */}
+        <Sheet open={!!propsTarget} onOpenChange={(o) => !o && setPropsTarget(null)}>
+          <SheetContent className="w-[480px] overflow-y-auto p-0">
+
+            {/* Tool properties */}
+            {propsTarget?.kind === "tool" && (() => {
+              const ps = propsTarget as { toolName: string; ownerAgentId: string; description: string };
+              const meta = TOOL_META[ps.toolName] ?? { emoji: "🔧" };
+              return (
+                <>
+                  <div className="px-6 py-5 bg-gradient-to-br from-emerald-500 to-teal-600">
+                    <div className="flex items-center gap-3">
+                      <span className="text-3xl">{meta.emoji}</span>
+                      <div>
+                        <p className="font-bold text-white text-lg">{ps.toolName}</p>
+                        <p className="text-emerald-100 text-xs font-medium uppercase tracking-wide">Internal Tool</p>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="p-6 space-y-5">
+                    <div>
+                      <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-2">Description</p>
+                      <p className="text-sm text-gray-700">{ps.description || "No description available."}</p>
+                    </div>
+                    {TOOL_FIELDS[ps.toolName]?.length > 0 && (
+                      <div className={cn(
+                        "rounded-xl p-4 border",
+                        configuredTools.has(ps.toolName)
+                          ? "bg-emerald-50 border-emerald-200"
+                          : "bg-amber-50 border-amber-200"
+                      )}>
+                        <p className={cn("text-xs font-bold mb-1", configuredTools.has(ps.toolName) ? "text-emerald-700" : "text-amber-700")}>
+                          {configuredTools.has(ps.toolName) ? "✓ Credentials saved" : "⚙️ Credentials required"}
+                        </p>
+                        <p className={cn("text-xs", configuredTools.has(ps.toolName) ? "text-emerald-600" : "text-amber-600")}>
+                          {configuredTools.has(ps.toolName)
+                            ? "Your API key is stored and will be injected at runtime."
+                            : "Use the + panel to add this tool and enter your credentials."}
+                        </p>
+                      </div>
+                    )}
+                    <div className="pt-3 border-t">
+                      <Button size="sm" variant="destructive" onClick={() => removeTool(ps.toolName, ps.ownerAgentId)}>
+                        Remove Tool
+                      </Button>
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
+
+            {/* MCP properties */}
+            {propsTarget?.kind === "mcp" && (() => {
+              const ps = propsTarget as { serverId: string; serverName: string };
+              const server = mcpServers.find((s) => s.id === ps.serverId);
+              const discovered = mcpToolsMap[ps.serverId]?.tools ?? [];
+              return (
+                <>
+                  <div className="px-6 py-5 bg-gradient-to-br from-amber-500 to-orange-500">
+                    <div className="flex items-center gap-3">
+                      <span className="text-3xl">🔌</span>
+                      <div>
+                        <p className="font-bold text-white text-lg">{ps.serverName}</p>
+                        <p className="text-amber-100 text-xs font-medium uppercase tracking-wide">MCP · External Server</p>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="p-6 space-y-5">
+                    {server && (
+                      <div>
+                        <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-2">Connection</p>
+                        <p className="text-sm font-mono text-gray-700 bg-gray-50 rounded-lg px-3 py-2 break-all">{server.url}</p>
+                        <p className="text-xs text-muted-foreground mt-1.5">Transport: <span className="font-medium">{server.transport.toUpperCase()}</span></p>
+                      </div>
+                    )}
+                    <div>
+                      <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-2">
+                        Available Tools ({discovered.length})
+                      </p>
+                      {discovered.length === 0
+                        ? <p className="text-xs text-muted-foreground bg-gray-50 rounded-lg p-3">No tools discovered — server may be offline.</p>
+                        : (
+                          <div className="space-y-1.5">
+                            {discovered.map((t) => (
+                              <div key={t.name} className="flex items-start gap-2 p-2.5 bg-amber-50 border border-amber-100 rounded-lg">
+                                <span className="text-xs font-mono font-bold text-amber-800">{t.name}</span>
+                                {t.description && <span className="text-xs text-gray-500 truncate">— {t.description}</span>}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                    </div>
+                    <div className="pt-3 border-t">
+                      <Button size="sm" variant="destructive" onClick={() => removeMCPServer(ps.serverId)}>
+                        Disconnect Server
+                      </Button>
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
+
+            {/* Agent properties */}
+            {(propsTarget?.kind === "root-agent" || propsTarget?.kind === "sub-agent") && editAgent && (
+              <>
+                <div className={cn(
+                  "px-6 py-5",
+                  propsTarget.kind === "root-agent"
+                    ? "bg-gradient-to-br from-violet-600 to-purple-700"
+                    : "bg-gradient-to-br from-blue-600 to-indigo-700"
+                )}>
+                  <div className="flex items-center gap-3">
+                    <span className="text-3xl">{propsTarget.kind === "root-agent" ? "🟣" : "🔵"}</span>
+                    <div>
+                      <p className="font-bold text-white text-lg">{editAgent.name}</p>
+                      <p className="text-white/70 text-xs font-medium uppercase tracking-wide">
+                        {propsTarget.kind === "root-agent" ? "Supervisor Agent" : "Sub-agent · Internal"}
+                      </p>
+                    </div>
+                  </div>
+                  {/* Quick stats */}
+                  <div className="flex gap-3 mt-3">
+                    <span className="text-xs text-white/80 bg-white/10 rounded-full px-2.5 py-1">
+                      🔧 {editAgent.config.tools.length} tools
+                    </span>
+                    <span className="text-xs text-white/80 bg-white/10 rounded-full px-2.5 py-1">
+                      🌡 {editAgent.config.llm.temperature}
+                    </span>
+                    <span className="text-xs text-white/80 bg-white/10 rounded-full px-2.5 py-1">
+                      🧠 {editAgent.config.memory.type}
+                    </span>
+                  </div>
+                </div>
+                <div className="p-4">
+                  <AgentForm
+                    agent={editAgent}
+                    allAgents={allAgents.filter((a) => a.id !== editAgent.id)}
+                    onSubmit={handleEditSave}
+                    onCancel={() => setPropsTarget(null)}
+                    submitting={editSubmitting}
+                  />
+                </div>
+              </>
+            )}
+
+          </SheetContent>
+        </Sheet>
+      </div>
+    </Ctx.Provider>
+  );
+}

@@ -9,7 +9,10 @@ from uuid import UUID
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import AgentDB, ChatDB, MessageDB, PersonaDB, RunDB, RunEventDB, WorkflowDB
+from app.db.models import (
+    AgentDB, ChatDB, MCPServerDB, MessageDB, PersonaDB, RunDB,
+    RunEventDB, SkillDB, UserToolConfigDB,
+)
 from app.domain import utcnow
 
 
@@ -109,60 +112,125 @@ async def delete_persona(session: AsyncSession, *, persona_id: UUID, user_id: UU
     return True
 
 
-# ---- Workflows ------------------------------------------------------------
+# ---- Skills --------------------------------------------------------------
 
-async def create_workflow(
-    session: AsyncSession, *, user_id: UUID, name: str, definition: dict, is_template: bool = False
-) -> WorkflowDB:
-    row = WorkflowDB(user_id=user_id, name=name, definition=definition, is_template=is_template)
+async def create_skill(session: AsyncSession, *, user_id: UUID, name: str, content: str) -> SkillDB:
+    row = SkillDB(user_id=user_id, name=name, content=content)
     session.add(row)
     await session.commit()
     await session.refresh(row)
     return row
 
 
-async def get_workflow(session: AsyncSession, *, workflow_id: UUID, user_id: UUID) -> WorkflowDB | None:
-    """Returns the workflow if owned by `user_id` OR if it's a global template (user_id IS NULL)."""
-    stmt = select(WorkflowDB).where(
-        WorkflowDB.id == workflow_id,
-        or_(WorkflowDB.user_id == user_id, WorkflowDB.user_id.is_(None)),
+async def get_skill(session: AsyncSession, *, skill_id: UUID, user_id: UUID) -> SkillDB | None:
+    stmt = select(SkillDB).where(
+        SkillDB.id == skill_id,
+        or_(SkillDB.user_id == user_id, SkillDB.user_id.is_(None)),
     )
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
-async def list_workflows(session: AsyncSession, *, user_id: UUID) -> list[WorkflowDB]:
-    """User's own workflows + global templates. Templates first (visual grouping), then mine."""
+async def list_skills(session: AsyncSession, *, user_id: UUID) -> list[SkillDB]:
     stmt = (
-        select(WorkflowDB)
-        .where(or_(WorkflowDB.user_id == user_id, WorkflowDB.user_id.is_(None)))
-        .order_by(WorkflowDB.is_template.desc(), WorkflowDB.created_at.desc())
+        select(SkillDB)
+        .where(or_(SkillDB.user_id == user_id, SkillDB.user_id.is_(None)))
+        .order_by(SkillDB.user_id.is_(None).desc(), SkillDB.name)
     )
     return list((await session.execute(stmt)).scalars().all())
 
 
-async def list_templates(session: AsyncSession) -> list[WorkflowDB]:
-    stmt = select(WorkflowDB).where(WorkflowDB.is_template.is_(True)).order_by(WorkflowDB.name)
-    return list((await session.execute(stmt)).scalars().all())
-
-
-async def update_workflow(
-    session: AsyncSession, *, workflow_id: UUID, user_id: UUID, name: str, definition: dict
-) -> WorkflowDB | None:
-    """User can only edit their OWN workflows — templates are read-only."""
-    stmt = select(WorkflowDB).where(WorkflowDB.id == workflow_id, WorkflowDB.user_id == user_id)
+async def update_skill(
+    session: AsyncSession, *, skill_id: UUID, user_id: UUID, name: str, content: str
+) -> SkillDB | None:
+    stmt = select(SkillDB).where(SkillDB.id == skill_id, SkillDB.user_id == user_id)
     row = (await session.execute(stmt)).scalar_one_or_none()
     if row is None:
         return None
     row.name = name
-    row.definition = definition
+    row.content = content
     await session.commit()
     await session.refresh(row)
     return row
 
 
-async def delete_workflow(session: AsyncSession, *, workflow_id: UUID, user_id: UUID) -> bool:
-    stmt = select(WorkflowDB).where(WorkflowDB.id == workflow_id, WorkflowDB.user_id == user_id)
+async def delete_skill(session: AsyncSession, *, skill_id: UUID, user_id: UUID) -> bool:
+    stmt = select(SkillDB).where(SkillDB.id == skill_id, SkillDB.user_id == user_id)
     row = (await session.execute(stmt)).scalar_one_or_none()
+    if row is None:
+        return False
+    await session.delete(row)
+    await session.commit()
+    return True
+
+
+# ---- User Tool Configs ---------------------------------------------------
+
+async def upsert_tool_config(
+    session: AsyncSession, *, user_id: UUID, tool_name: str, config: dict,
+) -> UserToolConfigDB:
+    """Create or update tool config for a user. Upsert by (user_id, tool_name)."""
+    stmt = select(UserToolConfigDB).where(
+        UserToolConfigDB.user_id == user_id, UserToolConfigDB.tool_name == tool_name,
+    )
+    row = (await session.execute(stmt)).scalar_one_or_none()
+    if row is None:
+        row = UserToolConfigDB(user_id=user_id, tool_name=tool_name, config=config)
+        session.add(row)
+    else:
+        row.config = config
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def list_tool_configs(session: AsyncSession, *, user_id: UUID) -> list[UserToolConfigDB]:
+    stmt = select(UserToolConfigDB).where(UserToolConfigDB.user_id == user_id)
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def get_tool_config(
+    session: AsyncSession, *, user_id: UUID, tool_name: str,
+) -> UserToolConfigDB | None:
+    stmt = select(UserToolConfigDB).where(
+        UserToolConfigDB.user_id == user_id, UserToolConfigDB.tool_name == tool_name,
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def delete_tool_config(session: AsyncSession, *, user_id: UUID, tool_name: str) -> bool:
+    row = await get_tool_config(session, user_id=user_id, tool_name=tool_name)
+    if row is None:
+        return False
+    await session.delete(row)
+    await session.commit()
+    return True
+
+
+# ---- MCP Servers ---------------------------------------------------------
+
+async def create_mcp_server(
+    session: AsyncSession, *, user_id: UUID, name: str, url: str,
+    transport: str = "http", headers: dict | None = None,
+) -> MCPServerDB:
+    row = MCPServerDB(user_id=user_id, name=name, url=url, transport=transport, headers=headers or {})
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def get_mcp_server(session: AsyncSession, *, server_id: UUID, user_id: UUID) -> MCPServerDB | None:
+    stmt = select(MCPServerDB).where(MCPServerDB.id == server_id, MCPServerDB.user_id == user_id)
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def list_mcp_servers(session: AsyncSession, *, user_id: UUID) -> list[MCPServerDB]:
+    stmt = select(MCPServerDB).where(MCPServerDB.user_id == user_id).order_by(MCPServerDB.created_at.desc())
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def delete_mcp_server(session: AsyncSession, *, server_id: UUID, user_id: UUID) -> bool:
+    row = await get_mcp_server(session, server_id=server_id, user_id=user_id)
     if row is None:
         return False
     await session.delete(row)
@@ -204,6 +272,27 @@ async def get_chat(session: AsyncSession, *, chat_id: UUID, user_id: UUID) -> Ch
 async def list_chats(session: AsyncSession, *, user_id: UUID) -> list[ChatDB]:
     stmt = select(ChatDB).where(ChatDB.user_id == user_id).order_by(ChatDB.updated_at.desc())
     return list((await session.execute(stmt)).scalars().all())
+
+
+async def update_chat(
+    session: AsyncSession,
+    *,
+    chat_id: UUID,
+    user_id: UUID,
+    agent_id: UUID | None = None,
+    persona_id: UUID | None = None,
+) -> ChatDB | None:
+    """Reassign agent or persona. Only non-None fields are updated."""
+    row = await get_chat(session, chat_id=chat_id, user_id=user_id)
+    if row is None:
+        return None
+    if agent_id is not None:
+        row.agent_id = agent_id
+    if persona_id is not None:
+        row.persona_id = persona_id
+    await session.commit()
+    await session.refresh(row)
+    return row
 
 
 async def delete_chat(session: AsyncSession, *, chat_id: UUID, user_id: UUID) -> bool:

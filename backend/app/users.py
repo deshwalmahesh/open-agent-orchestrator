@@ -22,6 +22,7 @@ log = structlog.get_logger()
 class UserRead(schemas.BaseUser[uuid.UUID]):
     name: str = ""
     slack_user_id: str | None = None
+    plan: str = "free"
 
 
 class UserCreate(schemas.BaseUserCreate):
@@ -31,6 +32,7 @@ class UserCreate(schemas.BaseUserCreate):
 class UserUpdate(schemas.BaseUserUpdate):
     name: str | None = None
     slack_user_id: str | None = None
+    plan: str | None = None  # only superusers should elevate this in prod
 
 
 async def get_user_db(

@@ -8,9 +8,8 @@ install:
 dev:
 	uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
-# One-command demo: install deps + start API. SQLite + create_all bootstraps schema
-# and the lifespan seeds 2 workflow templates. Slack adapter auto-starts iff both
-# SLACK_BOT_TOKEN + SLACK_APP_TOKEN are set in backend/.env.
+# One-command demo: install deps + start API. SQLite + create_all bootstraps schema.
+# Slack adapter auto-starts iff both SLACK_BOT_TOKEN + SLACK_APP_TOKEN are set.
 demo: install
 	uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 

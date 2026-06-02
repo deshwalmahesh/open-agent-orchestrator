@@ -1,4 +1,4 @@
-"""End-to-end agent integration: AgentConfig → build_agent → LIVE LLM → tool call → final answer.
+"""End-to-end agent integration: AgentConfig → build_agent_tree → LIVE LLM → tool call → final answer.
 
 This is the test that catches the real-world breakages (wrong prompt format,
 tool not bound, LLM doesn't pick up the tool, message reducer broken, etc.).
@@ -7,10 +7,11 @@ Skipped if no LLM creds.
 
 import pytest
 from langchain_core.messages import HumanMessage
+from unittest.mock import AsyncMock
 
 from app.config import get_settings
 from app.domain import AgentConfig, LLMConfig
-from app.runtime.agent import build_agent
+from app.runtime.agent import build_agent_tree
 
 _s = get_settings()
 _HAS_LLM = bool(_s.vllm_base_url and _s.vllm_api_key and _s.vllm_default_model)
@@ -38,7 +39,7 @@ async def test_agent_uses_calculator_tool_for_arithmetic():
     """Hard regression: agent must (a) compile, (b) invoke LLM, (c) emit a
     tool_call for calculator, (d) get the tool result back, (e) return final
     answer containing the correct number."""
-    agent = build_agent(_cfg(tools=["calculator"]))
+    agent = await build_agent_tree(_cfg(tools=["calculator"]), session=AsyncMock())
 
     result = await agent.ainvoke(
         {"messages": [HumanMessage("What is 17 times 23? Show only the number.")]}
@@ -51,7 +52,7 @@ async def test_agent_uses_calculator_tool_for_arithmetic():
 
 async def test_agent_without_tools_still_answers():
     """Tool-less agent: should produce a text answer, no crash on empty tool list."""
-    agent = build_agent(_cfg(tools=[]))
+    agent = await build_agent_tree(_cfg(tools=[]), session=AsyncMock())
 
     result = await agent.ainvoke(
         {"messages": [HumanMessage("Reply with exactly the word: pong")]}

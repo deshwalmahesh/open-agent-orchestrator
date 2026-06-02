@@ -5,33 +5,46 @@ Flow per turn:
   The task: emit run.started, build messages from history (last window N), invoke agent,
   persist agent reply, emit run.finished with usage, close emitter, drop from registry.
 
-No checkpointer is wired here — chat memory is rebuilt from MessageDB each turn
-(simpler, no Redis dependency). The checkpointer seam in build_agent stays for
-future HITL/interrupt work.
+Cross-turn memory is DB-based (MessageDB + rolling summary on ChatDB).
+Within-run graph state uses LangGraph's Redis checkpointer (thread_id = run_id),
+enabling mid-graph interrupts and multi-step ReAct replay.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
+from io import BytesIO
 from uuid import UUID
 
 import structlog
 from langchain_core.messages import AIMessage, HumanMessage
-from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
+from pypdf import PdfReader
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session_factory
-from app.db.models import AgentDB, ChatDB, PersonaDB
+from app.db.models import AgentDB, ChatDB, PersonaDB, SkillDB
 from app.db.repos import (
     create_run,
     finalize_run,
     insert_message,
     list_messages,
+    list_tool_configs,
 )
 from app.domain import AgentConfig, LLMConfig
-from app.llm import build_chat_model
-from app.runtime.agent import build_agent
+from app.llm import build_chat_model, invoke_with_retry
+from app.runtime.agent import build_agent_tree
 from app.runtime.events import EMITTERS, RunEventEmitter
 
 log = structlog.get_logger()
+
+# Set once at startup from main.py lifespan. None = Redis unavailable (runs still work,
+# but no within-run graph checkpointing for HITL/interrupts).
+_CHECKPOINTER = None
+
+
+def set_checkpointer(saver) -> None:
+    global _CHECKPOINTER
+    _CHECKPOINTER = saver
 
 
 def _to_lc_messages(rows) -> list:
@@ -118,6 +131,8 @@ async def _load_chat_and_agent(
     chat = await session.get(ChatDB, chat_id)
     if chat is None:
         raise ValueError(f"chat not found: {chat_id}")
+    if chat.agent_id is None:
+        raise ValueError(f"chat {chat_id} has no agent assigned — reassign via PATCH /chats/{{id}}")
     agent_row = await session.get(AgentDB, chat.agent_id)
     if agent_row is None:
         raise ValueError(f"agent not found: {chat.agent_id}")
@@ -129,11 +144,46 @@ async def _load_chat_and_agent(
         if persona is not None:
             effective_prompt = persona.system_prompt
 
+    # Inject skill documents into the prompt
+    for skill_id in cfg.skills:
+        skill = await session.get(SkillDB, skill_id)
+        if skill is not None:
+            effective_prompt += f"\n\n---\nSkill: {skill.name}\n{skill.content}\n---"
+
     return chat, cfg, effective_prompt
 
 
-async def _execute(run_id: UUID, chat_id: UUID, user_text: str) -> None:
+def _process_files(files: list[dict]) -> tuple[str, list[dict]]:
+    """Process file attachments. Returns (text_to_prepend, image_content_blocks).
+    PDF → extracted text prepended. Image → content block for multimodal LLM."""
+    text_parts: list[str] = []
+    image_blocks: list[dict] = []
+
+    for f in files:
+        mime = f.get("mime_type", "")
+        raw = base64.b64decode(f["content_base64"])
+
+        if mime == "application/pdf":
+            reader = PdfReader(BytesIO(raw))
+            pages = "\n\n".join((p.extract_text() or "") for p in reader.pages)
+            text_parts.append(f"[Attached PDF: {f['name']}]\n{pages}")
+
+        elif mime.startswith("image/"):
+            b64 = f["content_base64"]
+            image_blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+
+        else:
+            log.warning("file.unsupported", name=f.get("name"), mime=mime)
+
+    return "\n\n".join(text_parts), image_blocks
+
+
+async def _execute(run_id: UUID, chat_id: UUID, user_text: str, files: list[dict] | None = None) -> None:
     """The actual run, scheduled via asyncio.create_task."""
+    log.info("run.start", run_id=str(run_id), chat_id=str(chat_id))
     session_factory = get_session_factory()
     emitter = RunEventEmitter(run_id, session_factory)
     EMITTERS[run_id] = emitter
@@ -143,20 +193,46 @@ async def _execute(run_id: UUID, chat_id: UUID, user_text: str) -> None:
 
         async with session_factory() as session:
             chat, cfg, system_prompt = await _load_chat_and_agent(session, chat_id=chat_id)
-            # User turn persisted first so the agent sees its own newest input.
+            # Process file attachments: PDF text prepended, images as content blocks
+            file_text, image_blocks = _process_files(files or [])
+            full_user_text = f"{file_text}\n\n{user_text}".strip() if file_text else user_text
+
             await insert_message(
-                session, chat_id=chat_id, run_id=run_id, sender="user", content=user_text
+                session, chat_id=chat_id, run_id=run_id, sender="user", content=full_user_text
             )
             summary, verbatim = await _resolve_context(session, chat, cfg)
 
-        lc_messages = _to_lc_messages(verbatim)
-        run_cfg = cfg.model_copy(update={"system_prompt": _effective_prompt(system_prompt, summary)})
-        agent = build_agent(run_cfg)
-        # recursion_limit caps tool-loop iterations; LangGraph raises if exceeded.
-        result = await agent.ainvoke(
-            {"messages": lc_messages},
-            config={"recursion_limit": max(2, cfg.limits.max_steps)},
-        )
+            lc_messages = _to_lc_messages(verbatim)
+
+            # For multimodal: replace the last HumanMessage with image content blocks
+            if image_blocks and lc_messages:
+                last_msg = lc_messages[-1]
+                if hasattr(last_msg, "content") and isinstance(last_msg.content, str):
+                    lc_messages[-1] = HumanMessage(content=[
+                        {"type": "text", "text": last_msg.content},
+                        *image_blocks,
+                    ])
+            # Build per-user tool registry with their stored API keys
+            from app.runtime.tools import build_registry
+            user_configs = await list_tool_configs(session, user_id=chat.user_id)
+            tc = {r.tool_name: r.config for r in user_configs}
+            user_registry = build_registry(tool_configs=tc) if tc else None
+
+            run_cfg = cfg.model_copy(update={"system_prompt": _effective_prompt(system_prompt, summary)})
+            agent = await build_agent_tree(
+                run_cfg, session=session, checkpointer=_CHECKPOINTER,
+                tool_registry=user_registry,
+            )
+            # thread_id = run_id (not chat_id) — each run gets its own checkpoint
+            # so within-run graph state doesn't conflict with our DB-based cross-turn history.
+            result = await invoke_with_retry(
+                agent,
+                {"messages": lc_messages},
+                config={
+                    "recursion_limit": max(2, cfg.limits.max_steps),
+                    "configurable": {"thread_id": str(run_id)},
+                },
+            )
 
         final = result["messages"][-1]
         reply = getattr(final, "content", "") or ""
@@ -182,6 +258,7 @@ async def _execute(run_id: UUID, chat_id: UUID, user_text: str) -> None:
 
         await emitter.emit("agent.message", {"sender": sender_id, "content": reply})
         await emitter.emit("run.finished", {"usage": usage, "status": "succeeded"})
+        log.info("run.succeeded", run_id=str(run_id), tokens=usage.get("total_tokens", 0))
     except Exception as exc:  # noqa: BLE001 — top-level boundary; we log + persist
         log.exception("run.failed", run_id=str(run_id), error=str(exc))
         async with session_factory() as session:
@@ -200,14 +277,14 @@ _PENDING: set[asyncio.Task] = set()
 
 
 async def start_run(
-    session: AsyncSession, *, chat_id: UUID, user_text: str
+    session: AsyncSession, *, chat_id: UUID, user_text: str, files: list[dict] | None = None
 ) -> UUID:
     """Create Run row, schedule background task, return run_id immediately."""
     chat = await session.get(ChatDB, chat_id)
     if chat is None:
         raise ValueError(f"chat not found: {chat_id}")
     run = await create_run(session, chat_id=chat_id, agent_id=chat.agent_id)
-    task = asyncio.create_task(_execute(run.id, chat_id, user_text))
+    task = asyncio.create_task(_execute(run.id, chat_id, user_text, files=files or []))
     _PENDING.add(task)
     task.add_done_callback(_PENDING.discard)
     return run.id

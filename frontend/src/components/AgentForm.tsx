@@ -12,6 +12,7 @@ import { listTools } from "@/api/tools";
 import { listSkills } from "@/api/skills";
 import { useAuth } from "@/hooks/useAuth";
 import { cn } from "@/lib/utils";
+import { getLLMDefaults, saveLLMDefaults } from "@/lib/llm-defaults";
 import type { Agent, AgentConfig } from "@/types";
 
 // ─── Provider quick-select ────────────────────────────────────────────────────
@@ -22,20 +23,12 @@ const PROVIDER_PRESETS = [
   { label: "Custom",   url: "",                            model: "" },
 ] as const;
 
-// ─── Tool icons ───────────────────────────────────────────────────────────────
-const TOOL_EMOJI: Record<string, string> = {
-  web_search: "🔍",
-  calculator: "🧮",
-  html_to_markdown: "📄",
-  pdf_to_text: "📑",
-  python_sandbox: "🐍",
-};
-
-// ─── Zod schema (unchanged) ───────────────────────────────────────────────────
+// ─── Zod schema ───────────────────────────────────────────────────────────────
+// Name + role intentionally NOT required: for a root pipeline the supervisor's
+// identity-naming friction was reported as overload. Defaults fill in if blank.
 const schema = z.object({
-  name: z.string().min(1, "Required"),
-  role: z.string().min(1, "Required"),
-  description: z.string().optional(),
+  name: z.string(),
+  role: z.string(),
   system_prompt: z.string().min(1, "Required"),
   llm_base_url: z.string().min(1, "Required"),
   llm_api_key: z.string(),
@@ -47,7 +40,6 @@ const schema = z.object({
   memory_window: z.number().int().min(1),
   memory_threshold: z.number().int().min(1),
   max_steps: z.number().int().min(1),
-  blocked_topics: z.string(),
   skills: z.array(z.string()),
   subagents: z.array(z.string()),
 });
@@ -58,7 +50,6 @@ function configToForm(config: AgentConfig): FormValues {
   return {
     name: config.name,
     role: config.role,
-    description: config.description ?? "",
     system_prompt: config.system_prompt,
     llm_base_url: config.llm.base_url,
     llm_api_key: config.llm.api_key,
@@ -70,7 +61,6 @@ function configToForm(config: AgentConfig): FormValues {
     memory_window: config.memory.window,
     memory_threshold: config.memory.summary_threshold,
     max_steps: config.limits.max_steps,
-    blocked_topics: config.guardrails.blocked_topics.join(", "),
     skills: config.skills,
     subagents: config.subagents,
   };
@@ -78,9 +68,9 @@ function configToForm(config: AgentConfig): FormValues {
 
 function formToConfig(values: FormValues, existing?: AgentConfig): AgentConfig {
   return {
-    name: values.name,
-    role: values.role,
-    description: values.description || null,
+    name: values.name.trim() || existing?.name || "Pipeline",
+    role: values.role.trim() || existing?.role || "supervisor",
+    description: existing?.description ?? null,
     system_prompt: values.system_prompt,
     llm: {
       base_url: values.llm_base_url,
@@ -98,40 +88,35 @@ function formToConfig(values: FormValues, existing?: AgentConfig): AgentConfig {
     },
     limits: {
       max_steps: values.max_steps,
-      max_tokens_per_run: existing?.limits.max_tokens_per_run ?? null,
-    },
-    guardrails: {
-      blocked_topics: values.blocked_topics.split(",").map((s) => s.trim()).filter(Boolean),
-      require_human_approval_for: existing?.guardrails.require_human_approval_for ?? [],
     },
     subagents: values.subagents,
     skills: values.skills,
     mcp_servers: existing?.mcp_servers ?? [],
-    schedules: existing?.schedules ?? [],
     channels: existing?.channels ?? [],
     metadata: existing?.metadata ?? {},
   };
 }
 
-const DEFAULT_VALUES: FormValues = {
-  name: "",
-  role: "assistant",
-  description: "",
-  system_prompt: "You are a helpful assistant.",
-  llm_base_url: "https://api.openai.com/v1",
-  llm_api_key: "EMPTY",
-  llm_model: "gpt-4o-mini",
-  llm_temperature: 0.7,
-  llm_max_tokens: 1024,
-  tools: [],
-  memory_type: "summary",
-  memory_window: 10,
-  memory_threshold: 20,
-  max_steps: 8,
-  blocked_topics: "",
-  skills: [],
-  subagents: [],
-};
+function getDefaultValues(): FormValues {
+  const llm = getLLMDefaults();
+  return {
+    name: "",
+    role: "supervisor",
+    system_prompt: "You are a helpful assistant.",
+    llm_base_url: llm.base_url,
+    llm_api_key: llm.api_key,
+    llm_model: llm.model,
+    llm_temperature: llm.temperature,
+    llm_max_tokens: llm.max_tokens,
+    tools: [],
+    memory_type: "summary",
+    memory_window: 10,
+    memory_threshold: 20,
+    max_steps: 8,
+    skills: [],
+    subagents: [],
+  };
+}
 
 interface Props {
   agent?: Agent;
@@ -151,7 +136,7 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
     formState: { errors },
   } = useForm<FormValues>({
     resolver: zodResolver(schema),
-    defaultValues: agent ? configToForm(agent.config) : DEFAULT_VALUES,
+    defaultValues: agent ? configToForm(agent.config) : getDefaultValues(),
   });
 
   const { data: tools = [] } = useQuery({
@@ -190,6 +175,14 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
   const activeProvider = PROVIDER_PRESETS.find((p) => p.url && currentBaseUrl === p.url)?.label ?? "Custom";
 
   async function onValid(values: FormValues) {
+    // Persist LLM settings so new agents / sub-agents pre-fill from them
+    saveLLMDefaults({
+      base_url: values.llm_base_url,
+      api_key: values.llm_api_key,
+      model: values.llm_model,
+      temperature: values.llm_temperature,
+      max_tokens: values.llm_max_tokens,
+    });
     await onSubmit(formToConfig(values, agent?.config));
   }
 
@@ -198,20 +191,15 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
 
       {/* ── Identity ──────────────────────────────────────────────────────── */}
       <section>
-        <div className="flex items-center gap-2 mb-3">
-          <span className="text-base">🪪</span>
-          <h3 className="text-sm font-bold text-gray-800">Identity</h3>
-        </div>
+        <h3 className="text-xs font-bold uppercase tracking-wider text-gray-400 mb-3">Identity</h3>
         <div className="grid grid-cols-2 gap-3">
           <div className="space-y-1.5">
-            <Label className="text-xs font-semibold text-gray-600">Name *</Label>
-            <Input {...register("name")} placeholder="Research Agent" className="focus-visible:ring-violet-300" />
-            {errors.name && <p className="text-xs text-destructive">{errors.name.message}</p>}
+            <Label className="text-xs font-semibold text-gray-600">Name</Label>
+            <Input {...register("name")} placeholder="Pipeline" className="focus-visible:ring-violet-300" />
           </div>
           <div className="space-y-1.5">
-            <Label className="text-xs font-semibold text-gray-600">Role *</Label>
-            <Input {...register("role")} placeholder="researcher, coder, analyst…" className="focus-visible:ring-violet-300" />
-            {errors.role && <p className="text-xs text-destructive">{errors.role.message}</p>}
+            <Label className="text-xs font-semibold text-gray-600">Role</Label>
+            <Input {...register("role")} placeholder="supervisor" className="focus-visible:ring-violet-300" />
           </div>
         </div>
         <div className="mt-3 space-y-1.5">
@@ -224,10 +212,6 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
           />
           {errors.system_prompt && <p className="text-xs text-destructive">{errors.system_prompt.message}</p>}
         </div>
-        <div className="mt-3 space-y-1.5">
-          <Label className="text-xs font-semibold text-gray-600">Description</Label>
-          <Input {...register("description")} placeholder="Optional short description" className="focus-visible:ring-violet-300" />
-        </div>
       </section>
 
       <Separator />
@@ -235,10 +219,9 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
       {/* ── LLM Config ────────────────────────────────────────────────────── */}
       <section>
         <Collapsible defaultOpen>
-          <CollapsibleTrigger className="flex items-center gap-2 w-full text-left mb-3 group">
-            <span className="text-base">⚡</span>
-            <h3 className="text-sm font-bold text-gray-800 flex-1">LLM Config</h3>
-            <span className="text-xs text-gray-400 group-hover:text-gray-600 transition-colors">click to toggle</span>
+          <CollapsibleTrigger className="flex items-center w-full text-left mb-3 group">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-gray-400 flex-1">LLM Config</h3>
+            <span className="text-xs text-gray-300 group-hover:text-gray-500 transition-colors">toggle</span>
           </CollapsibleTrigger>
           <CollapsibleContent className="space-y-4">
 
@@ -286,12 +269,9 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
 
             {/* API key: hidden for paid plans, required for free */}
             {isPaid ? (
-              <div className="flex items-center gap-3 px-4 py-3 bg-gradient-to-r from-violet-50 to-purple-50 border border-violet-200 rounded-xl">
-                <span className="text-xl">🔑</span>
-                <div>
-                  <p className="text-xs font-bold text-violet-700">API key — managed by your plan</p>
-                  <p className="text-xs text-violet-500 mt-0.5">Your {user?.plan} plan provides LLM access automatically.</p>
-                </div>
+              <div className="px-4 py-3 bg-gradient-to-r from-violet-50 to-purple-50 border border-violet-200 rounded-xl">
+                <p className="text-xs font-bold text-violet-700">API key — managed by your plan</p>
+                <p className="text-xs text-violet-500 mt-0.5">Your {user?.plan} plan provides LLM access automatically.</p>
               </div>
             ) : (
               <div className="space-y-1.5">
@@ -348,13 +328,10 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
 
       {/* ── Tools (chip toggles) ──────────────────────────────────────────── */}
       <section>
-        <div className="flex items-center gap-2 mb-3">
-          <span className="text-base">🔧</span>
-          <h3 className="text-sm font-bold text-gray-800">Tools</h3>
+        <div className="flex items-center mb-3">
+          <h3 className="text-xs font-bold uppercase tracking-wider text-gray-400 flex-1">Tools</h3>
           {selectedTools.length > 0 && (
-            <span className="text-xs bg-emerald-100 text-emerald-700 rounded-full px-2 py-0.5 font-medium ml-auto">
-              {selectedTools.length} selected
-            </span>
+            <span className="text-xs text-emerald-600 font-medium">{selectedTools.length} selected</span>
           )}
         </div>
         {tools.length === 0 ? (
@@ -370,15 +347,13 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
                   title={t.description}
                   onClick={() => toggleItem("tools", t.name, !active)}
                   className={cn(
-                    "flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium transition-all",
+                    "px-3 py-1.5 rounded-full border text-xs font-medium transition-all",
                     active
                       ? "border-emerald-400 bg-emerald-50 text-emerald-700"
                       : "border-gray-200 text-gray-500 hover:border-emerald-200 hover:bg-emerald-50/50",
                   )}
                 >
-                  <span>{TOOL_EMOJI[t.name] ?? "🔧"}</span>
-                  {t.name}
-                  {active && <span className="text-emerald-500 ml-0.5">✓</span>}
+                  {t.display_name}
                 </button>
               );
             })}
@@ -390,10 +365,7 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
 
       {/* ── Memory type (visual cards) ────────────────────────────────────── */}
       <section>
-        <div className="flex items-center gap-2 mb-3">
-          <span className="text-base">🧠</span>
-          <h3 className="text-sm font-bold text-gray-800">Memory</h3>
-        </div>
+        <h3 className="text-xs font-bold uppercase tracking-wider text-gray-400 mb-3">Memory</h3>
         <div className="grid grid-cols-3 gap-2">
           {(["none", "buffer", "summary"] as const).map((v) => (
             <button
@@ -407,9 +379,6 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
                   : "border-gray-100 hover:border-violet-200 text-gray-400 hover:bg-violet-50/30",
               )}
             >
-              <span className="text-xl block mb-1">
-                {v === "none" ? "🚫" : v === "buffer" ? "📝" : "🧠"}
-              </span>
               <span className="text-xs font-semibold capitalize">{v}</span>
             </button>
           ))}
@@ -436,10 +405,7 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
       {subagentOptions.length > 0 && (
         <>
           <section>
-            <div className="flex items-center gap-2 mb-3">
-              <span className="text-base">🤖</span>
-              <h3 className="text-sm font-bold text-gray-800">Sub-Agents</h3>
-            </div>
+            <h3 className="text-xs font-bold uppercase tracking-wider text-gray-400 mb-3">Sub-Agents</h3>
             <div className="flex flex-wrap gap-2">
               {subagentOptions.map((a) => {
                 const active = selectedSubagents.includes(a.id);
@@ -449,14 +415,13 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
                     type="button"
                     onClick={() => toggleItem("subagents", a.id, !active)}
                     className={cn(
-                      "flex items-center gap-2 px-3 py-1.5 rounded-full border text-xs font-medium transition-all",
+                      "px-3 py-1.5 rounded-full border text-xs font-medium transition-all",
                       active
                         ? "border-blue-400 bg-blue-50 text-blue-700"
                         : "border-gray-200 text-gray-500 hover:border-blue-200 hover:bg-blue-50/50",
                     )}
                   >
-                    🤖 {a.name}
-                    {active && <span className="text-blue-500">✓</span>}
+                    {a.name}
                   </button>
                 );
               })}
@@ -470,11 +435,7 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
       {skillsList.length > 0 && (
         <>
           <section>
-            <div className="flex items-center gap-2 mb-3">
-              <span className="text-base">📚</span>
-              <h3 className="text-sm font-bold text-gray-800">Skills</h3>
-              <span className="text-xs text-muted-foreground ml-1">Context documents injected into system prompt</span>
-            </div>
+            <h3 className="text-xs font-bold uppercase tracking-wider text-gray-400 mb-3">Skills <span className="normal-case font-normal text-gray-300">— injected into system prompt</span></h3>
             <div className="flex flex-wrap gap-2">
               {skillsList.map((s) => {
                 const active = selectedSkills.includes(s.id);
@@ -485,14 +446,13 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
                     title={s.content.slice(0, 120)}
                     onClick={() => toggleItem("skills", s.id, !active)}
                     className={cn(
-                      "flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium transition-all",
+                      "px-3 py-1.5 rounded-full border text-xs font-medium transition-all",
                       active
                         ? "border-amber-400 bg-amber-50 text-amber-700"
                         : "border-gray-200 text-gray-500 hover:border-amber-200 hover:bg-amber-50/50",
                     )}
                   >
-                    📖 {s.name}
-                    {active && <span className="text-amber-500">✓</span>}
+                    {s.name}
                   </button>
                 );
               })}
@@ -502,25 +462,18 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
         </>
       )}
 
-      {/* ── Limits & Safety ──────────────────────────────────────────────── */}
+      {/* ── Limits ─────────────────────────────────────────────────────────── */}
       <section>
         <Collapsible>
-          <CollapsibleTrigger className="flex items-center gap-2 w-full text-left mb-3 group">
-            <span className="text-base">🛡️</span>
-            <h3 className="text-sm font-bold text-gray-800 flex-1">Limits & Safety</h3>
-            <span className="text-xs text-gray-400 group-hover:text-gray-600 transition-colors">click to expand</span>
+          <CollapsibleTrigger className="flex items-center w-full text-left mb-3 group">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-gray-400 flex-1">Limits</h3>
+            <span className="text-xs text-gray-300 group-hover:text-gray-500 transition-colors">expand</span>
           </CollapsibleTrigger>
           <CollapsibleContent>
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-1.5">
-                <Label className="text-xs font-semibold text-gray-600">Max Steps</Label>
-                <Input {...register("max_steps", { valueAsNumber: true })} type="number" min="1" className="focus-visible:ring-violet-300" />
-              </div>
-              <div className="space-y-1.5">
-                <Label className="text-xs font-semibold text-gray-600">Blocked Topics</Label>
-                <Input {...register("blocked_topics")} placeholder="violence, profanity" className="focus-visible:ring-violet-300" />
-                <p className="text-[10px] text-muted-foreground">Comma-separated</p>
-              </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs font-semibold text-gray-600">Max Steps</Label>
+              <Input {...register("max_steps", { valueAsNumber: true })} type="number" min="1" className="w-32 focus-visible:ring-violet-300" />
+              <p className="text-[10px] text-muted-foreground">Max ReAct iterations per run before the agent stops.</p>
             </div>
           </CollapsibleContent>
         </Collapsible>

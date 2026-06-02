@@ -21,6 +21,9 @@ class UserDB(SQLAlchemyBaseUserTableUUID, Base):
     slack_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True, index=True)
     # "free" | "paid" | "admin" — controls auto-seeded keys and rate limits
     plan: Mapped[str] = mapped_column(String(20), default="free", server_default="free")
+    # Per-user Slack bot tokens; first user to connect becomes the platform Slack bot
+    slack_bot_token: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    slack_app_token: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
 
 class AgentDB(Base):

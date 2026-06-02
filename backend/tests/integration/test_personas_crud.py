@@ -25,10 +25,11 @@ def test_list_isolation_between_users_plus_shared_globals(
     client.post("/personas", json={"name": "AliceVoice", "system_prompt": "..."}, headers=auth_header(alice))
     client.post("/personas", json={"name": "BobVoice", "system_prompt": "..."}, headers=auth_header(bob))
 
-    assert {p["name"] for p in client.get("/personas", headers=auth_header(alice)).json()} == {"AliceVoice", "Concise"}
-    assert {p["name"] for p in client.get("/personas", headers=auth_header(bob)).json()} == {"BobVoice", "Concise"}
+    # "Default Supervisor" is seeded by lifespan; both users always see it alongside owned + test globals.
+    assert {p["name"] for p in client.get("/personas", headers=auth_header(alice)).json()} == {"AliceVoice", "Concise", "Default Supervisor"}
+    assert {p["name"] for p in client.get("/personas", headers=auth_header(bob)).json()} == {"BobVoice", "Concise", "Default Supervisor"}
 
-    # Globals come first per repo ordering.
+    # Globals come first per repo ordering, then alphabetically — "Concise" < "Default Supervisor".
     first = client.get("/personas", headers=auth_header(alice)).json()[0]
     assert first["id"] == global_id
     assert first["owner_id"] is None

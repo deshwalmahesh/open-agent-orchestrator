@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.runtime.tools import REGISTRY
+from app.runtime.tools import DISPLAY_NAMES, REGISTRY
 
 router = APIRouter(tags=["health"])
 
@@ -12,9 +12,14 @@ async def health() -> dict[str, str]:
 
 @router.get("/tools")
 async def list_tools() -> list[dict]:
-    """Available tools from the platform REGISTRY. Returns REGISTRY keys (what agents
-    reference in config.tools), not the LangChain tool.name (which may differ)."""
+    """Available tools from the platform REGISTRY. `name` is the stable registry key
+    that agents reference in config.tools; `display_name` is the human label used by
+    the UI (falls back to the key if not in DISPLAY_NAMES)."""
     return [
-        {"name": key, "description": tool.description or ""}
+        {
+            "name": key,
+            "display_name": DISPLAY_NAMES.get(key, key),
+            "description": tool.description or "",
+        }
         for key, tool in REGISTRY.items()
     ]

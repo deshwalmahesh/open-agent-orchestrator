@@ -3,28 +3,29 @@ import { Link, useNavigate } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { cn } from "@/lib/utils";
+import { cn, isPipelineRoot } from "@/lib/utils";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import AgentForm from "@/components/AgentForm";
 import { listAgents, createAgent, updateAgent, deleteAgent } from "@/api/agents";
+import { getSlackStatus } from "@/api/slack";
 import { useAuth } from "@/hooks/useAuth";
+import { getLLMDefaults } from "@/lib/llm-defaults";
 import type { Agent, AgentConfig } from "@/types";
 
 function buildDefaultConfig(name: string): AgentConfig {
+  const llm = getLLMDefaults();
   return {
     name,
     role: "assistant",
     description: null,
     system_prompt: "You are a helpful assistant.",
-    llm: { base_url: "https://api.openai.com/v1", api_key: "EMPTY", model: "gpt-4o-mini", temperature: 0.7, max_tokens: 1024, timeout_s: 30.0 },
+    llm: { base_url: llm.base_url, api_key: llm.api_key, model: llm.model, temperature: llm.temperature, max_tokens: llm.max_tokens, timeout_s: 30.0 },
     tools: [],
     memory: { type: "summary", window: 10, summary_threshold: 20 },
-    limits: { max_steps: 8, max_tokens_per_run: null },
-    guardrails: { blocked_topics: [], require_human_approval_for: [] },
+    limits: { max_steps: 8 },
     subagents: [],
     skills: [],
     mcp_servers: [],
-    schedules: [],
     channels: [],
     metadata: {},
   };
@@ -45,6 +46,18 @@ export default function Agents() {
     enabled: !!token,
   });
 
+  const { data: slackStatus } = useQuery({
+    queryKey: ["slack-status"],
+    queryFn: () => getSlackStatus(token!),
+    enabled: !!token,
+    staleTime: 30_000,
+  });
+  const slackActiveId = slackStatus?.active_agent_id ?? null;
+
+  // Pipelines page shows only root pipelines, not sub-agents.
+  // Sub-agents are edited inside the canvas (right-click → properties).
+  const pipelines = agents.filter((a) => isPipelineRoot(a, agents));
+
   const deleteMut = useMutation({
     mutationFn: (id: string) => deleteAgent(token!, id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["agents"] }),
@@ -55,7 +68,7 @@ export default function Agents() {
   async function handleNewAgent() {
     if (creating) return;
     setCreating(true);
-    const autoName = agents.length === 0 ? "My Agent" : `Agent ${agents.length + 1}`;
+    const autoName = pipelines.length === 0 ? "My Pipeline" : `Pipeline ${pipelines.length + 1}`;
     try {
       const agent = await createAgent(token!, buildDefaultConfig(autoName));
       await qc.invalidateQueries({ queryKey: ["agents"] });
@@ -86,32 +99,31 @@ export default function Agents() {
   return (
     <div className="p-6">
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-xl font-semibold">Agents</h1>
+        <h1 className="text-xl font-semibold">Pipelines</h1>
         <Button
           onClick={handleNewAgent}
           disabled={creating}
           className="bg-violet-600 hover:bg-violet-700 text-white"
         >
-          {creating ? "Creating…" : "+ New Agent"}
+          {creating ? "Creating…" : "+ New Pipeline"}
         </Button>
       </div>
 
-      {agents.length === 0 ? (
+      {pipelines.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-20 text-center">
-          <div className="text-5xl mb-4">🤖</div>
-          <p className="text-lg font-medium text-gray-700 mb-1">No agents yet</p>
-          <p className="text-sm text-muted-foreground mb-6">Create your first agent — you'll design it visually on the canvas.</p>
+          <p className="text-lg font-medium text-gray-700 mb-1">No pipelines yet</p>
+          <p className="text-sm text-muted-foreground mb-6">Create your first pipeline — you'll design it visually on the canvas.</p>
           <Button
             onClick={handleNewAgent}
             disabled={creating}
             className="bg-violet-600 hover:bg-violet-700 text-white"
           >
-            {creating ? "Creating…" : "+ Create your first agent"}
+            {creating ? "Creating…" : "+ Create your first pipeline"}
           </Button>
         </div>
       ) : (
         <div className="space-y-2">
-          {agents.map((agent) => (
+          {pipelines.map((agent) => (
             <div
               key={agent.id}
               className="flex items-center gap-3 border rounded-xl p-4 hover:bg-violet-50/40 hover:border-violet-200 transition-colors"
@@ -123,6 +135,12 @@ export default function Agents() {
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="font-semibold text-gray-900">{agent.name}</span>
                   <Badge variant="secondary" className="text-xs font-normal">{agent.config.role}</Badge>
+                  {agent.id === slackActiveId && (
+                    <Badge className="text-xs font-medium bg-emerald-100 text-emerald-700 hover:bg-emerald-100 border border-emerald-200">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block mr-1.5" />
+                      Slack active
+                    </Badge>
+                  )}
                   {agent.config.subagents.length > 0 && (
                     <Badge variant="outline" className="text-xs font-normal text-blue-600 border-blue-200">
                       {agent.config.subagents.length} sub-agent{agent.config.subagents.length > 1 ? "s" : ""}
@@ -157,7 +175,7 @@ export default function Agents() {
                   variant="ghost"
                   size="sm"
                   className="text-destructive hover:text-destructive text-xs"
-                  onClick={() => { if (confirm(`Delete agent "${agent.name}"?`)) deleteMut.mutate(agent.id); }}
+                  onClick={() => { if (confirm(`Delete pipeline "${agent.name}"?`)) deleteMut.mutate(agent.id); }}
                 >
                   Delete
                 </Button>

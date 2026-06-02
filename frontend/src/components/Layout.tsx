@@ -15,7 +15,7 @@ export default function Layout() {
         <Separator className="mb-4" />
         <nav className="flex-1 space-y-1">
           {[
-            { to: "/agents", label: "Agents" },
+            { to: "/agents", label: "Pipelines" },
             { to: "/chats", label: "Chats" },
             { to: "/skills", label: "Skills" },
           ].map(({ to, label }) => (

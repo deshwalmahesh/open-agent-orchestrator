@@ -24,12 +24,6 @@ export interface MemoryConfig {
 
 export interface Limits {
   max_steps: number;
-  max_tokens_per_run?: number | null;
-}
-
-export interface Guardrails {
-  blocked_topics: string[];
-  require_human_approval_for: string[];
 }
 
 export interface ChannelBinding {
@@ -46,11 +40,9 @@ export interface AgentConfig {
   tools: string[];
   memory: MemoryConfig;
   limits: Limits;
-  guardrails: Guardrails;
   subagents: string[];
   skills: string[];
   mcp_servers: string[];
-  schedules: string[];
   channels: ChannelBinding[];
   metadata: Record<string, unknown>;
 }

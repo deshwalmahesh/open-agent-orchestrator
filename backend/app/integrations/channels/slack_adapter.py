@@ -32,9 +32,25 @@ async def _find_user_by_slack(session: AsyncSession, slack_uid: str) -> UserDB |
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
-async def _newest_agent(session: AsyncSession, user_id: UUID) -> AgentDB | None:
+async def _slack_agent(session: AsyncSession, user_id: UUID) -> AgentDB | None:
+    """Return the agent to route a Slack message to.
+
+    Priority:
+    1. Any agent with an explicit Slack channel binding (user designated it for Slack).
+    2. Fall back to most recently updated agent.
+    """
+    stmt = select(AgentDB).where(AgentDB.user_id == user_id)
+    agents = (await session.execute(stmt)).scalars().all()
+    for ag in agents:
+        channels = (ag.config or {}).get("channels", [])
+        if any(c.get("channel") == "slack" for c in channels):
+            return ag
+    # Fallback: most recently saved/deployed agent
     stmt = (
-        select(AgentDB).where(AgentDB.user_id == user_id).order_by(AgentDB.created_at.desc()).limit(1)
+        select(AgentDB)
+        .where(AgentDB.user_id == user_id)
+        .order_by(AgentDB.updated_at.desc())
+        .limit(1)
     )
     return (await session.execute(stmt)).scalar_one_or_none()
 
@@ -42,12 +58,15 @@ async def _newest_agent(session: AsyncSession, user_id: UUID) -> AgentDB | None:
 async def _find_or_create_chat(
     session: AsyncSession, *, user_id: UUID, agent_id: UUID, channel: str, thread_ts: str
 ) -> ChatDB:
-    """Threads on the same Slack channel+thread_ts share one Chat (conversation memory)."""
+    """Same Slack thread + same active pipeline → reuse the Chat (continue conversation).
+    Pipeline switch (different agent_id under same thread) → new Chat (the user-spec'd
+    behavior: switching pipeline always starts a new conversation, even mid-thread)."""
     ext_id = f"{channel}:{thread_ts}"
     stmt = select(ChatDB).where(
         ChatDB.user_id == user_id,
         ChatDB.channel == "slack",
         ChatDB.external_thread_id == ext_id,
+        ChatDB.agent_id == agent_id,
     )
     existing = (await session.execute(stmt)).scalar_one_or_none()
     if existing is not None:
@@ -128,7 +147,7 @@ async def handle_slack_message(
             )
             return
 
-        agent = await _newest_agent(session, user.id)
+        agent = await _slack_agent(session, user.id)
         if agent is None:
             await say(
                 thread_ts=thread_ts,

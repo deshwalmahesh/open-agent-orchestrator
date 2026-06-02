@@ -1,8 +1,13 @@
-"""build_agent_tree(AgentConfig, session) → CompiledStateGraph.
+"""build_agent_tree(AgentConfig, session_factory) → CompiledStateGraph.
 
 Recursive: sub-agents listed in cfg.subagents are wrapped as LangChain tools
 so the parent LLM can delegate via tool-call. Each sub-agent runs its own
 ReAct loop (own recursion_limit). Depth is capped at MAX_AGENT_DEPTH.
+
+Builds open a short-lived session for DB lookups (MCP server rows, sub-agent
+config rows) and close it before returning. The compiled graph holds NO open
+DB session — LLM calls and tool execution run without a pinned connection.
+Sub-agent delegation captures the factory and opens its own session on invoke.
 
 Retry on transient LLM errors deferred to middleware (P6): `Runnable.with_retry()`
 breaks bind_tools, can't be the model arg."""
@@ -16,7 +21,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph.state import CompiledStateGraph
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.models import AgentDB, MCPServerDB
 from app.domain import AgentConfig
@@ -31,18 +36,20 @@ MAX_AGENT_DEPTH = 4
 def _make_subagent_tool(
     sub_cfg: AgentConfig,
     depth: int,
-    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
     tool_registry: dict[str, BaseTool] | None = None,
 ) -> BaseTool:
     """Wrap a sub-agent as a LangChain tool. The parent's LLM calls it by name
-    with a single `task` string; the sub-agent runs its own ReAct loop."""
+    with a single `task` string; the sub-agent runs its own ReAct loop. The
+    factory is captured so the sub-agent build can open its own session at
+    invoke time (no shared session held across the parent's LLM call)."""
 
     description = f"{sub_cfg.role}: {sub_cfg.description or sub_cfg.system_prompt[:120]}"
 
     @tool_decorator(sub_cfg.name, description=description)
     async def _delegate(task: str) -> str:
         sub_agent = await build_agent_tree(
-            sub_cfg, depth=depth + 1, session=session, tool_registry=tool_registry,
+            sub_cfg, depth=depth + 1, session_factory=session_factory, tool_registry=tool_registry,
         )
         result = await invoke_with_retry(
             sub_agent,
@@ -58,7 +65,7 @@ async def build_agent_tree(
     cfg: AgentConfig,
     *,
     depth: int = 0,
-    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
     checkpointer: BaseCheckpointSaver | None = None,
     tool_registry: dict[str, BaseTool] | None = None,
 ) -> CompiledStateGraph:
@@ -72,36 +79,42 @@ async def build_agent_tree(
 
     base_tools = get_tools(cfg.tools, registry=tool_registry)
 
-    # MCP tools — connect to external MCP servers and discover tools at runtime
+    # Resolve MCP server rows + sub-agent config rows in one short-lived session, then close.
+    # Network calls (MCP get_tools) happen AFTER the session closes so we never pin a
+    # connection during external I/O.
+    server_configs: dict = {}
+    sub_cfgs: list[AgentConfig] = []
+    if cfg.mcp_servers or cfg.subagents:
+        async with session_factory() as session:
+            for sid in cfg.mcp_servers:
+                row = await session.get(MCPServerDB, sid)
+                if row is None:
+                    log.warning("mcp_server.missing", agent=cfg.name, missing_id=str(sid))
+                    continue
+                server_configs[row.name] = {
+                    "url": row.url, "transport": row.transport, "headers": row.headers or {},
+                }
+            for sa_id in cfg.subagents:
+                sa_row = await session.get(AgentDB, sa_id)
+                if sa_row is None:
+                    log.warning("subagent.missing", parent=cfg.name, missing_id=str(sa_id))
+                    continue
+                sub_cfgs.append(AgentConfig.model_validate(sa_row.config))
+
     mcp_tools: list[BaseTool] = []
-    if cfg.mcp_servers:
+    if server_configs:
         from langchain_mcp_adapters.client import MultiServerMCPClient
 
-        server_configs: dict = {}
-        for sid in cfg.mcp_servers:
-            row = await session.get(MCPServerDB, sid)
-            if row is None:
-                log.warning("mcp_server.missing", agent=cfg.name, missing_id=str(sid))
-                continue
-            server_configs[row.name] = {
-                "url": row.url, "transport": row.transport, "headers": row.headers or {},
-            }
-        if server_configs:
-            try:
-                client = MultiServerMCPClient(server_configs)
-                mcp_tools = await client.get_tools()
-                log.info("mcp.tools_loaded", agent=cfg.name, tools=[t.name for t in mcp_tools])
-            except Exception as exc:
-                log.warning("mcp.connect_failed", agent=cfg.name, error=str(exc))
+        try:
+            client = MultiServerMCPClient(server_configs)
+            mcp_tools = await client.get_tools()
+            log.info("mcp.tools_loaded", agent=cfg.name, tools=[t.name for t in mcp_tools])
+        except Exception as exc:
+            log.warning("mcp.connect_failed", agent=cfg.name, error=str(exc))
 
-    sub_tools: list[BaseTool] = []
-    for sa_id in cfg.subagents:
-        sa_row = await session.get(AgentDB, sa_id)
-        if sa_row is None:
-            log.warning("subagent.missing", parent=cfg.name, missing_id=str(sa_id))
-            continue
-        sa_cfg = AgentConfig.model_validate(sa_row.config)
-        sub_tools.append(_make_subagent_tool(sa_cfg, depth, session, tool_registry))
+    sub_tools: list[BaseTool] = [
+        _make_subagent_tool(sa_cfg, depth, session_factory, tool_registry) for sa_cfg in sub_cfgs
+    ]
 
     all_tools = base_tools + mcp_tools + sub_tools
 

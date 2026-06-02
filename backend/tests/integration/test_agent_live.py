@@ -39,7 +39,7 @@ async def test_agent_uses_calculator_tool_for_arithmetic():
     """Hard regression: agent must (a) compile, (b) invoke LLM, (c) emit a
     tool_call for calculator, (d) get the tool result back, (e) return final
     answer containing the correct number."""
-    agent = await build_agent_tree(_cfg(tools=["calculator"]), session=AsyncMock())
+    agent = await build_agent_tree(_cfg(tools=["calculator"]), session_factory=AsyncMock())
 
     result = await agent.ainvoke(
         {"messages": [HumanMessage("What is 17 times 23? Show only the number.")]}
@@ -52,7 +52,7 @@ async def test_agent_uses_calculator_tool_for_arithmetic():
 
 async def test_agent_without_tools_still_answers():
     """Tool-less agent: should produce a text answer, no crash on empty tool list."""
-    agent = await build_agent_tree(_cfg(tools=[]), session=AsyncMock())
+    agent = await build_agent_tree(_cfg(tools=[]), session_factory=AsyncMock())
 
     result = await agent.ainvoke(
         {"messages": [HumanMessage("Reply with exactly the word: pong")]}

@@ -4,15 +4,17 @@ from __future__ import annotations
 import asyncio
 from typing import Annotated
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
 from app.db import get_async_session
 from app.db.models import UserDB
 from app.db.repos import delete_tool_config, get_tool_config, list_tool_configs, upsert_tool_config
 from app.users import current_active_user
+
+log = structlog.get_logger()
 
 router = APIRouter(prefix="/tool-configs", tags=["tools"])
 
@@ -35,22 +37,7 @@ async def list_mine(
     user: Annotated[UserDB, Depends(current_active_user)],
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> list[dict]:
-    configs = await list_tool_configs(session, user_id=user.id)
-    # Auto-seed Tavily for paid/admin users when the backend has a global key and
-    # the user hasn't provided their own. This lets privileged users skip the
-    # "Setup required" step on the canvas.
-    settings = get_settings()
-    if user.plan != "free" and settings.tavily_api_key:
-        has_tavily = any(c.tool_name == "web_search" for c in configs)
-        if not has_tavily:
-            row = await upsert_tool_config(
-                session,
-                user_id=user.id,
-                tool_name="web_search",
-                config={"api_key": settings.tavily_api_key},
-            )
-            configs.append(row)
-    return [_to_response(r) for r in configs]
+    return [_to_response(r) for r in await list_tool_configs(session, user_id=user.id)]
 
 
 @router.put("/{tool_name}")
@@ -102,15 +89,13 @@ async def validate(
     api_key = body.config.get("api_key", "").strip()
     if not api_key:
         return {"ok": False, "error": "API key is required"}
-    if not api_key.startswith("tvly-"):
-        return {"ok": False, "error": "Tavily keys must start with tvly-"}
     try:
         from langchain_tavily import TavilySearch
         tool = TavilySearch(max_results=1, tavily_api_key=api_key)
         await asyncio.to_thread(tool.invoke, "test")
         return {"ok": True}
     except Exception as exc:
-        msg = str(exc)
-        if "401" in msg or "unauthorized" in msg.lower():
-            return {"ok": False, "error": "Invalid API key"}
-        return {"ok": False, "error": msg[:150]}
+        # Log the exception class for diagnosability without echoing the raw message
+        # (Tavily errors may contain the submitted key — never bounce it back to the client).
+        log.warning("tool.validate.failed", tool=tool_name, exc_type=type(exc).__name__)
+        return {"ok": False, "error": "Could not authenticate with Tavily — check the API key."}

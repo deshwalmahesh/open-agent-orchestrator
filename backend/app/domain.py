@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Literal
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,7 +18,10 @@ def utcnow() -> datetime:
 
 
 class _Base(BaseModel):
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    # extra="ignore": stored config blobs predate some fields (or carry fields we've
+    # since dropped, e.g. AgentConfig.id/created_at/updated_at). Silently drop unknowns
+    # rather than failing model_validate when loading an existing row.
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
 
 class LLMConfig(_Base):
@@ -52,12 +55,6 @@ class MemoryConfig(_Base):
 
 class Limits(_Base):
     max_steps: int = 8
-    max_tokens_per_run: int | None = None
-
-
-class Guardrails(_Base):
-    blocked_topics: list[str] = Field(default_factory=list)
-    require_human_approval_for: list[str] = Field(default_factory=list)  # tool names
 
 
 class ChannelBinding(_Base):
@@ -66,7 +63,7 @@ class ChannelBinding(_Base):
 
 
 class AgentConfig(_Base):
-    id: UUID = Field(default_factory=uuid4)
+    # No id/created_at/updated_at — AgentDB row holds those authoritatively.
     name: str
     role: str
     description: str | None = None
@@ -75,15 +72,11 @@ class AgentConfig(_Base):
     tools: list[str] = Field(default_factory=list)  # tool names from app.runtime.tools.REGISTRY
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     limits: Limits = Field(default_factory=Limits)
-    guardrails: Guardrails = Field(default_factory=Guardrails)
     subagents: list[UUID] = Field(default_factory=list)  # agent UUIDs wrapped as tools at runtime
     skills: list[UUID] = Field(default_factory=list)  # SkillDB UUIDs — content injected into prompt at runtime
     mcp_servers: list[UUID] = Field(default_factory=list)  # MCPServerDB UUIDs — tools discovered at runtime
-    schedules: list[str] = Field(default_factory=list)  # cron strings; stretch (P6)
     channels: list[ChannelBinding] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=utcnow)
-    updated_at: datetime = Field(default_factory=utcnow)
 
 
 EventType = Literal[

@@ -17,9 +17,10 @@ from app.api.mcp_servers import router as mcp_router
 from app.api.personas import router as personas_router
 from app.api.runs import router as runs_router
 from app.api.skills import router as skills_router
+from app.api.slack import router as slack_router
 from app.api.tool_configs import router as tool_configs_router
 from app.config import get_settings
-from app.db import create_all
+from app.db import create_all, seed_defaults
 from app.logging import configure_logging
 from app.runtime.checkpointer import build_checkpointer
 from app.services.run_service import drain_pending, set_checkpointer
@@ -37,6 +38,7 @@ async def lifespan(app: FastAPI):
     # App-data DB. create_all is idempotent. README documents this is v1-grade
     # (no Alembic); prod swaps DATABASE_URL to Postgres and adds migrations.
     await create_all()
+    await seed_defaults()
 
     # Checkpointer is required for any Run, but we want /health to stay green
     # if Redis is briefly down during dev. Log loudly; downstream endpoints
@@ -55,13 +57,30 @@ async def lifespan(app: FastAPI):
             hint="run `docker compose up` — runs still work without Redis but no within-run checkpointing",
         )
 
-    # Slack — single platform bot. Stays off unless BOTH tokens are configured.
+    # Slack — single platform bot. Starts from env vars OR from the first user
+    # who connected via POST /slack/connect (tokens saved in UserDB).
     app.state.slack = None
     app.state.slack_task = None
-    if settings.slack_bot_token and settings.slack_app_token:
+    _slack_bot = settings.slack_bot_token
+    _slack_app = settings.slack_app_token
+    if not (_slack_bot and _slack_app):
+        # Fall back to any user's saved tokens
+        from sqlalchemy import select
+        from app.db import get_session_factory
+        from app.db.models import UserDB as _UserDB
+        async with get_session_factory()() as _s:
+            _row = (await _s.execute(
+                select(_UserDB).where(
+                    _UserDB.slack_bot_token.isnot(None),
+                    _UserDB.slack_app_token.isnot(None),
+                ).limit(1)
+            )).scalar_one_or_none()
+            if _row:
+                _slack_bot = _row.slack_bot_token
+                _slack_app = _row.slack_app_token
+    if _slack_bot and _slack_app:
         from app.integrations.channels.slack_adapter import SlackAdapter
-
-        app.state.slack = SlackAdapter(settings.slack_bot_token, settings.slack_app_token)
+        app.state.slack = SlackAdapter(_slack_bot, _slack_app)
         app.state.slack_task = asyncio.create_task(app.state.slack.start())
 
     try:
@@ -125,6 +144,7 @@ def create_app() -> FastAPI:
         fastapi_users.get_users_router(UserRead, UserUpdate), prefix="/users", tags=["users"]
     )
     app.include_router(agents_router)
+    app.include_router(slack_router)
     app.include_router(personas_router)
     app.include_router(skills_router)
     app.include_router(mcp_router)

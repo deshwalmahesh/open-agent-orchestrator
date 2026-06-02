@@ -34,6 +34,7 @@ from app.domain import AgentConfig, LLMConfig
 from app.llm import build_chat_model, invoke_with_retry
 from app.runtime.agent import build_agent_tree
 from app.runtime.events import EMITTERS, RunEventEmitter
+from app.runtime.tools import build_registry
 
 log = structlog.get_logger()
 
@@ -191,9 +192,15 @@ async def _execute(run_id: UUID, chat_id: UUID, user_text: str, files: list[dict
     try:
         await emitter.emit("run.started", {"chat_id": str(chat_id), "input": user_text})
 
+        # Phase 1: all pre-LLM DB work in one short-lived session, then close.
+        # Holding a session across the LLM round-trip would pin a connection from the
+        # pool for the duration of the call (60s+ with retries).
         async with session_factory() as session:
             chat, cfg, system_prompt = await _load_chat_and_agent(session, chat_id=chat_id)
-            # Process file attachments: PDF text prepended, images as content blocks
+            # sender_id captured here so we don't touch chat.agent_id after session close
+            # (scalar columns survive close because expire_on_commit=False, but explicit is safer)
+            sender_id = str(chat.agent_id)
+
             file_text, image_blocks = _process_files(files or [])
             full_user_text = f"{file_text}\n\n{user_text}".strip() if file_text else user_text
 
@@ -202,47 +209,41 @@ async def _execute(run_id: UUID, chat_id: UUID, user_text: str, files: list[dict
             )
             summary, verbatim = await _resolve_context(session, chat, cfg)
 
-            lc_messages = _to_lc_messages(verbatim)
-
-            # For multimodal: replace the last HumanMessage with image content blocks
-            if image_blocks and lc_messages:
-                last_msg = lc_messages[-1]
-                if hasattr(last_msg, "content") and isinstance(last_msg.content, str):
-                    lc_messages[-1] = HumanMessage(content=[
-                        {"type": "text", "text": last_msg.content},
-                        *image_blocks,
-                    ])
-            # Build per-user tool registry with their stored API keys
-            from app.runtime.tools import build_registry
             user_configs = await list_tool_configs(session, user_id=chat.user_id)
             tc = {r.tool_name: r.config for r in user_configs}
-            user_registry = build_registry(tool_configs=tc) if tc else None
 
-            run_cfg = cfg.model_copy(update={"system_prompt": _effective_prompt(system_prompt, summary)})
-            agent = await build_agent_tree(
-                run_cfg, session=session, checkpointer=_CHECKPOINTER,
-                tool_registry=user_registry,
-            )
-            # thread_id = run_id (not chat_id) — each run gets its own checkpoint
-            # so within-run graph state doesn't conflict with our DB-based cross-turn history.
-            result = await invoke_with_retry(
-                agent,
-                {"messages": lc_messages},
-                config={
-                    "recursion_limit": max(2, cfg.limits.max_steps),
-                    "configurable": {"thread_id": str(run_id)},
-                },
-            )
+        # Phase 2: build LangChain messages + agent tree + LLM call — no session held.
+        lc_messages = _to_lc_messages(verbatim)
+        # For multimodal: replace the last HumanMessage with image content blocks
+        if image_blocks and lc_messages:
+            last_msg = lc_messages[-1]
+            if hasattr(last_msg, "content") and isinstance(last_msg.content, str):
+                lc_messages[-1] = HumanMessage(content=[
+                    {"type": "text", "text": last_msg.content},
+                    *image_blocks,
+                ])
+        user_registry = build_registry(tool_configs=tc) if tc else None
+        run_cfg = cfg.model_copy(update={"system_prompt": _effective_prompt(system_prompt, summary)})
+        agent = await build_agent_tree(
+            run_cfg, session_factory=session_factory, checkpointer=_CHECKPOINTER,
+            tool_registry=user_registry,
+        )
+        # thread_id = run_id (not chat_id) — each run gets its own checkpoint so
+        # within-run graph state doesn't conflict with our DB-based cross-turn history.
+        result = await invoke_with_retry(
+            agent,
+            {"messages": lc_messages},
+            config={
+                "recursion_limit": max(2, cfg.limits.max_steps),
+                "configurable": {"thread_id": str(run_id)},
+            },
+        )
 
         final = result["messages"][-1]
         reply = getattr(final, "content", "") or ""
         usage = _extract_usage(result["messages"])
 
-        # sender = AgentDB row id (chat.agent_id), NOT cfg.id — cfg.id is the
-        # AgentConfig pydantic instance UUID, regenerated on every model_validate()
-        # because the field has default_factory=uuid4. Using it would make sender
-        # unjoinable to the agents table.
-        sender_id = str(chat.agent_id)
+        # Phase 3: post-LLM persistence — fresh session, sender_id captured in Phase 1.
         async with session_factory() as session:
             await insert_message(
                 session,

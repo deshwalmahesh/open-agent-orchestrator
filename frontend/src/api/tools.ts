@@ -1,7 +1,8 @@
 import { apiFetch } from "./client";
 
 export interface Tool {
-  name: string;
+  name: string;          // stable registry key (used in agent config)
+  display_name: string;  // human label for UI
   description: string;
 }
 

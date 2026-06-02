@@ -41,11 +41,18 @@ def pdf_to_text(path: str) -> str:
 
 @tool
 async def python_sandbox(code: str) -> str:
-    """Run Python code in a subprocess (5s timeout, stdlib only). Returns stdout."""
+    """Run a short Python snippet in a subprocess with a 5s timeout. Returns stdout.
+
+    Isolation is partial: `-I` blocks user site-packages, PYTHONPATH, and other env-driven
+    site lookups, and we pass an empty environment so the process inherits no host secrets
+    (API keys, JWT secrets, DB URLs). The subprocess still has the host's Python install
+    on disk and full network — do NOT treat this as a security boundary for untrusted code.
+    """
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-c", code,
+        sys.executable, "-I", "-c", code,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env={},
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=5.0)
@@ -56,6 +63,18 @@ async def python_sandbox(code: str) -> str:
     if proc.returncode != 0:
         raise RuntimeError(f"python_sandbox: {err.decode(errors='replace').strip()}")
     return out.decode(errors="replace")
+
+
+# Human-readable labels for the registry keys. The agent's config references the
+# stable lowercase key (e.g. "web_search"); the UI shows DISPLAY_NAMES[key].
+# Unknown keys fall back to the registry key itself.
+DISPLAY_NAMES: dict[str, str] = {
+    "calculator": "Calculator",
+    "web_search": "Web Search",
+    "html_to_markdown": "HTML → Markdown",
+    "pdf_to_text": "PDF → Text",
+    "python_sandbox": "Python Sandbox",
+}
 
 
 def build_registry(*, tool_configs: dict[str, dict] | None = None) -> dict[str, BaseTool]:

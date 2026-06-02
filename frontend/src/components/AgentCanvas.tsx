@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import {
   ReactFlow,
   Background,
@@ -22,23 +22,16 @@ import { updateAgent, createAgent as apiCreateAgent } from "@/api/agents";
 import { listTools } from "@/api/tools";
 import { listMCPServers, discoverMCPTools, createMCPServer } from "@/api/mcp-servers";
 import { listToolConfigs, upsertToolConfig, validateToolConfig } from "@/api/tool-configs";
-import { listPersonas } from "@/api/personas";
+import { listPersonas, createPersona } from "@/api/personas";
 import { useAuth } from "@/hooks/useAuth";
-import { cn } from "@/lib/utils";
+import { cn, isPipelineRoot } from "@/lib/utils";
+import { saveLLMDefaults } from "@/lib/llm-defaults";
 import type { Agent, AgentConfig, MCPServer } from "@/types";
 import "@xyflow/react/dist/style.css";
 
 // ─── Tool credential fields ───────────────────────────────────────────────────
 const TOOL_FIELDS: Record<string, Array<{ key: string; label: string; placeholder: string; required: boolean }>> = {
   web_search: [{ key: "api_key", label: "Tavily API Key", placeholder: "tvly-xxxxxxxxxxxxxxxx", required: true }],
-};
-
-const TOOL_META: Record<string, { emoji: string }> = {
-  web_search:       { emoji: "🔍" },
-  calculator:       { emoji: "🧮" },
-  html_to_markdown: { emoji: "📄" },
-  pdf_to_text:      { emoji: "📑" },
-  python_sandbox:   { emoji: "🐍" },
 };
 
 const PROVIDERS = [
@@ -64,9 +57,7 @@ type CreateAgentForm = {
   base_url: string;
   api_key: string;
   model: string;
-  personaMode: "new" | "select";
   personaId: string;
-  systemPrompt: string;
 };
 
 const DEFAULT_AGENT_FORM: CreateAgentForm = {
@@ -75,9 +66,7 @@ const DEFAULT_AGENT_FORM: CreateAgentForm = {
   base_url: "https://api.openai.com/v1",
   api_key: "",
   model: "",
-  personaMode: "new",
   personaId: "",
-  systemPrompt: "You are a helpful assistant.",
 };
 
 // ─── Layout: 3-tier waterfall (top=supervisor, mid=internal, bottom=external) ──
@@ -182,7 +171,7 @@ function SubAgentNode({ id, data, selected }: NodeProps) {
     >
       <div className="absolute inset-y-0 left-0 w-1.5 rounded-l-2xl bg-blue-500" />
       <div className="pl-4 pr-3 py-3">
-        <p className="text-[9px] font-extrabold uppercase tracking-widest text-blue-500 mb-1">Agent · Internal</p>
+        <p className="text-[9px] font-extrabold uppercase tracking-widest text-blue-500 mb-1">Sub Agent</p>
         <p className="font-semibold text-sm text-blue-900 truncate">{data.label as string}</p>
         {(data.role as string) && <p className="text-[11px] text-blue-400 truncate mt-0.5">{data.role as string}</p>}
       </div>
@@ -209,7 +198,7 @@ function SubAgentNode({ id, data, selected }: NodeProps) {
 function ToolNode({ data, selected }: NodeProps) {
   const { onProps, onRemoveTool } = useCtx();
   const toolName = data.toolName as string;
-  const meta = TOOL_META[toolName] ?? { emoji: "🔧" };
+  const displayName = (data.displayName as string) || toolName;
   return (
     <div
       className={cn(
@@ -224,10 +213,7 @@ function ToolNode({ data, selected }: NodeProps) {
       <div className="absolute inset-y-0 left-0 w-1.5 rounded-l-2xl bg-emerald-500" />
       <div className="pl-4 pr-3 py-3">
         <p className="text-[9px] font-extrabold uppercase tracking-widest text-emerald-500 mb-1">Tool · Internal</p>
-        <div className="flex items-center gap-2">
-          <span>{meta.emoji}</span>
-          <p className="font-semibold text-sm text-emerald-900 truncate">{toolName}</p>
-        </div>
+        <p className="font-semibold text-sm text-emerald-900 truncate">{displayName}</p>
       </div>
       {selected && (
         <div className="absolute -bottom-8 left-0 right-0 flex justify-center z-10">
@@ -261,7 +247,7 @@ function MCPNode({ data, selected }: NodeProps) {
       <div className="absolute inset-y-0 left-0 w-1.5 rounded-l-2xl bg-amber-500" />
       <div className="pl-4 pr-3 py-3">
         <p className="text-[9px] font-extrabold uppercase tracking-widest text-amber-500 mb-1">MCP · External</p>
-        <p className="font-semibold text-sm text-amber-900 truncate">🔌 {data.label as string}</p>
+        <p className="font-semibold text-sm text-amber-900 truncate">{data.label as string}</p>
         <p className="text-[11px] text-amber-400 mt-0.5">{tools.length} tool{tools.length !== 1 ? "s" : ""}</p>
       </div>
       {selected && (
@@ -291,13 +277,11 @@ function patchAgent(qc: QueryClient, agentId: string, config: AgentConfig) {
 }
 
 // ─── Section header component ─────────────────────────────────────────────────
-function SectionHeader({ label, color, count }: { label: string; color: string; count?: number }) {
+function SectionHeader({ label, count }: { label: string; count?: number }) {
   return (
-    <div className={cn("flex items-center gap-2 px-3 py-2 rounded-lg mb-2", color)}>
-      <span className="text-xs font-bold uppercase tracking-wider">{label}</span>
-      {count !== undefined && (
-        <span className="ml-auto text-xs opacity-70">{count}</span>
-      )}
+    <div className="flex items-center mb-2 px-1">
+      <span className="text-[10px] font-bold uppercase tracking-widest text-gray-400 flex-1">{label}</span>
+      {count !== undefined && <span className="text-[10px] text-gray-300">{count}</span>}
     </div>
   );
 }
@@ -323,6 +307,12 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
   const [agentForm, setAgentForm] = useState<CreateAgentForm>(DEFAULT_AGENT_FORM);
   const [creatingAgent, setCreatingAgent] = useState(false);
 
+  // Inline persona creation (nested inside the agent-create form)
+  const [personaCreateOpen, setPersonaCreateOpen] = useState(false);
+  const [newPersonaName, setNewPersonaName] = useState("");
+  const [newPersonaPrompt, setNewPersonaPrompt] = useState("");
+  const [creatingPersona, setCreatingPersona] = useState(false);
+
   // Inline MCP registration (inside left panel's MCP section)
   const [mcpRegOpen, setMcpRegOpen] = useState(false);
   const [mcpRegForm, setMcpRegForm] = useState({ name: "", url: "", transport: "http" as "http" | "sse" });
@@ -347,6 +337,13 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
     enabled: !!token,
     staleTime: 60_000,
   });
+
+  // Default-select the first persona (typically the seeded Default Supervisor) when none picked.
+  useEffect(() => {
+    if (!agentForm.personaId && personas.length > 0) {
+      setAgentForm((f) => ({ ...f, personaId: personas[0].id }));
+    }
+  }, [personas, agentForm.personaId]);
 
   // Discover tools from ALL registered MCP servers in parallel
   const { data: mcpToolsMap = {} } = useQuery({
@@ -455,7 +452,19 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
     setAgentCreateOpen(false);
     setMcpRegOpen(false);
     setMcpRegState("idle");
-  }, []);
+    // Pre-fill new sub-agent form from root agent's LLM config (remove friction)
+    const llm = agent.config.llm;
+    if (llm.base_url || llm.model) {
+      const provider = PROVIDERS.find((p) => p.url === llm.base_url)?.label ?? "Custom";
+      setAgentForm((f) => ({
+        ...f,
+        provider,
+        base_url: llm.base_url || f.base_url,
+        api_key: llm.api_key !== "EMPTY" ? llm.api_key : f.api_key,
+        model: llm.model || f.model,
+      }));
+    }
+  }, [agent.config.llm]);
   const onProps = useCallback((t: PropsTarget) => setPropsTarget(t), []);
   const onRemoveTool = useCallback((n: string, owner: string) => removeTool(n, owner), [removeTool]);
   const onRemoveAgent = useCallback((id: string) => removeSubagent(id), [removeSubagent]);
@@ -468,6 +477,10 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
   // ── Graph ─────────────────────────────────────────────────────────────────
   const toolDescMap = useMemo(
     () => Object.fromEntries(registryTools.map((t) => [t.name, t.description])),
+    [registryTools],
+  );
+  const toolDisplayMap = useMemo(
+    () => Object.fromEntries(registryTools.map((t) => [t.name, t.display_name])),
     [registryTools],
   );
 
@@ -488,7 +501,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
 
     agent.config.tools.forEach((toolName) => {
       const nid = `${agent.id}::${toolName}`;
-      ns.push({ id: nid, type: "tool", data: { label: toolName, toolName, ownerAgentId: agent.id, description: toolDescMap[toolName] ?? "" }, position: { x: 0, y: 0 } });
+      ns.push({ id: nid, type: "tool", data: { label: toolName, toolName, displayName: toolDisplayMap[toolName] ?? toolName, ownerAgentId: agent.id, description: toolDescMap[toolName] ?? "" }, position: { x: 0, y: 0 } });
       es.push({ id: `e:${agent.id}->${nid}`, source: agent.id, target: nid, style: { stroke: "#10b981", strokeWidth: 2 } });
     });
 
@@ -499,7 +512,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
       es.push({ id: `e:${agent.id}->${sub.id}`, source: agent.id, target: sub.id, style: { stroke: "#3b82f6", strokeWidth: 2 } });
       sub.config.tools.forEach((toolName) => {
         const nid = `${sub.id}::${toolName}`;
-        ns.push({ id: nid, type: "tool", data: { label: toolName, toolName, ownerAgentId: sub.id, description: toolDescMap[toolName] ?? "" }, position: { x: 0, y: 0 } });
+        ns.push({ id: nid, type: "tool", data: { label: toolName, toolName, displayName: toolDisplayMap[toolName] ?? toolName, ownerAgentId: sub.id, description: toolDescMap[toolName] ?? "" }, position: { x: 0, y: 0 } });
         es.push({ id: `e:${sub.id}->${nid}`, source: sub.id, target: nid, style: { stroke: "#10b981", strokeWidth: 2 } });
       });
       sub.config.mcp_servers.forEach((serverId) => {
@@ -529,7 +542,9 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
     ? (addPanel.sourceAgentId === agent.id ? agent.config : allAgents.find((a) => a.id === addPanel.sourceAgentId)?.config ?? agent.config)
     : null;
   const panelTools = registryTools;
-  const panelAgents = allAgents.filter((a) => a.id !== agent.id);
+  // Sub-Agents picker: show only non-root agents (sub-agents) and exclude the current canvas root.
+  // Excludes OTHER pipelines' main agents — they're pipeline owners, not attachable sub-agents.
+  const panelAgents = allAgents.filter((a) => a.id !== agent.id && !isPipelineRoot(a, allAgents));
   const panelMCPServers = mcpServers;
 
   // ── Tool config dialog handlers ────────────────────────────────────────────
@@ -601,16 +616,29 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
     }
   }
 
+  async function handleCreatePersonaInline() {
+    if (!newPersonaName.trim() || !newPersonaPrompt.trim()) return;
+    setCreatingPersona(true);
+    try {
+      const p = await createPersona(token!, { name: newPersonaName.trim(), system_prompt: newPersonaPrompt.trim() });
+      await qc.invalidateQueries({ queryKey: ["personas"] });
+      setAgentForm((f) => ({ ...f, personaId: p.id }));
+      setPersonaCreateOpen(false);
+      setNewPersonaName(""); setNewPersonaPrompt("");
+    } catch (e) {
+      console.error("Failed to create persona:", e);
+    } finally {
+      setCreatingPersona(false);
+    }
+  }
+
   // ── Create new agent inline handler ───────────────────────────────────────
   async function handleSubmitNewAgent() {
-    if (!agentForm.name.trim() || !agentForm.base_url.trim() || !agentForm.model.trim()) return;
+    if (!agentForm.name.trim() || !agentForm.base_url.trim() || !agentForm.model.trim() || !agentForm.personaId) return;
     setCreatingAgent(true);
     try {
-      let systemPrompt = agentForm.systemPrompt;
-      if (agentForm.personaMode === "select" && agentForm.personaId) {
-        const p = personas.find((x) => x.id === agentForm.personaId);
-        systemPrompt = p?.system_prompt ?? systemPrompt;
-      }
+      const picked = personas.find((x) => x.id === agentForm.personaId);
+      const systemPrompt = picked?.system_prompt ?? "You are a helpful assistant.";
       const config: AgentConfig = {
         name: agentForm.name,
         role: "assistant",
@@ -626,15 +654,14 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
         },
         tools: [],
         memory: { type: "summary", window: 10, summary_threshold: 20 },
-        limits: { max_steps: 8, max_tokens_per_run: null },
-        guardrails: { blocked_topics: [], require_human_approval_for: [] },
+        limits: { max_steps: 8 },
         subagents: [],
         skills: [],
         mcp_servers: [],
-        schedules: [],
         channels: [],
         metadata: {},
       };
+      saveLLMDefaults({ base_url: agentForm.base_url, api_key: agentForm.api_key, model: agentForm.model });
       const newAgent = await apiCreateAgent(token!, config);
       await qc.invalidateQueries({ queryKey: ["agents"] });
       await addSubagent(newAgent.id);
@@ -702,7 +729,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
         <div className="absolute top-3 right-3 bg-white/90 border border-gray-200 rounded-xl p-3 text-xs shadow-sm backdrop-blur-sm space-y-1.5">
           <p className="font-bold text-[10px] uppercase tracking-wider text-gray-400 mb-2">Legend</p>
           <div className="flex items-center gap-2"><span className="w-2.5 h-2.5 rounded bg-violet-500" />Supervisor</div>
-          <div className="flex items-center gap-2"><span className="w-2.5 h-2.5 rounded bg-blue-500" />Agent <span className="text-gray-400">(internal)</span></div>
+          <div className="flex items-center gap-2"><span className="w-2.5 h-2.5 rounded bg-blue-500" />Sub Agent</div>
           <div className="flex items-center gap-2"><span className="w-2.5 h-2.5 rounded bg-emerald-500" />Tool <span className="text-gray-400">(internal)</span></div>
           <div className="flex items-center gap-2"><span className="w-2.5 h-2.5 rounded bg-amber-500" />MCP <span className="text-gray-400">(external)</span></div>
           <div className="mt-1.5 pt-1.5 border-t space-y-1">
@@ -729,7 +756,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
               {/* ── Agents section (root only) ────────────────────────────── */}
               {addPanel.isRoot && (
                 <section>
-                  <SectionHeader label="🤖 Sub-Agents" color="bg-blue-50 text-blue-700" count={panelAgents.length} />
+                  <SectionHeader label="Sub-Agents" count={panelAgents.length} />
 
                   {/* Create new agent inline */}
                   {!agentCreateOpen ? (
@@ -801,40 +828,61 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                       </div>
 
                       <div>
-                        <Label className="text-[11px] text-gray-600 block mb-1">System Prompt</Label>
-                        <div className="flex gap-1 mb-1.5">
-                          {(["new", "select"] as const).map((m) => (
+                        <div className="flex items-center justify-between mb-1">
+                          <Label className="text-[11px] text-gray-600">Persona (system prompt) *</Label>
+                          {!personaCreateOpen && (
                             <button
-                              key={m}
-                              onClick={() => setAgentForm((f) => ({ ...f, personaMode: m }))}
-                              className={cn(
-                                "flex-1 py-1 rounded text-[11px] font-medium border transition-colors",
-                                agentForm.personaMode === m
-                                  ? "bg-blue-500 text-white border-blue-500"
-                                  : "border-gray-200 text-gray-500 hover:bg-gray-50",
-                              )}
-                              disabled={m === "select" && personas.length === 0}
+                              type="button"
+                              onClick={() => setPersonaCreateOpen(true)}
+                              className="text-[11px] text-blue-600 hover:underline"
                             >
-                              {m === "new" ? "Write new" : `Use persona (${personas.length})`}
+                              + Create persona
                             </button>
-                          ))}
+                          )}
                         </div>
-                        {agentForm.personaMode === "new" ? (
-                          <textarea
-                            value={agentForm.systemPrompt}
-                            onChange={(e) => setAgentForm((f) => ({ ...f, systemPrompt: e.target.value }))}
-                            rows={3}
-                            placeholder="You are a helpful assistant…"
-                            className="w-full border border-input rounded-md px-2.5 py-1.5 text-xs bg-background resize-none focus:outline-none focus:ring-1 focus:ring-blue-300"
-                          />
+                        {personaCreateOpen ? (
+                          <div className="space-y-1.5 border border-blue-200 rounded-md p-2 bg-blue-50/30">
+                            <Input
+                              value={newPersonaName}
+                              onChange={(e) => setNewPersonaName(e.target.value)}
+                              placeholder="Persona name"
+                              className="h-7 text-xs"
+                              autoFocus
+                            />
+                            <textarea
+                              value={newPersonaPrompt}
+                              onChange={(e) => setNewPersonaPrompt(e.target.value)}
+                              placeholder="You are…"
+                              rows={3}
+                              className="w-full border border-input rounded-md px-2 py-1 text-xs bg-background resize-none focus:outline-none focus:ring-1 focus:ring-blue-300"
+                            />
+                            <div className="flex gap-1">
+                              <button
+                                type="button"
+                                onClick={() => { setPersonaCreateOpen(false); setNewPersonaName(""); setNewPersonaPrompt(""); }}
+                                className="px-2 py-0.5 text-[11px] text-gray-500 hover:underline"
+                              >Cancel</button>
+                              <button
+                                type="button"
+                                onClick={handleCreatePersonaInline}
+                                disabled={creatingPersona || !newPersonaName.trim() || !newPersonaPrompt.trim()}
+                                className="flex-1 py-1 rounded text-[11px] font-medium bg-blue-500 text-white disabled:opacity-50"
+                              >
+                                {creatingPersona ? "Saving…" : "Save & use"}
+                              </button>
+                            </div>
+                          </div>
                         ) : (
                           <select
                             value={agentForm.personaId}
                             onChange={(e) => setAgentForm((f) => ({ ...f, personaId: e.target.value }))}
                             className="w-full h-8 border border-input rounded-md px-2 text-xs bg-background"
                           >
-                            <option value="">Select persona…</option>
-                            {personas.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                            {personas.map((p) => (
+                              <option key={p.id} value={p.id}>
+                                {p.name}{p.owner_id === null ? " (default)" : ""}
+                              </option>
+                            ))}
                           </select>
                         )}
                       </div>
@@ -848,8 +896,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                           !agentForm.name.trim() ||
                           !agentForm.base_url.trim() ||
                           !agentForm.model.trim() ||
-                          (agentForm.personaMode === "new" && !agentForm.systemPrompt.trim()) ||
-                          (agentForm.personaMode === "select" && !agentForm.personaId)
+                          !agentForm.personaId
                         }
                       >
                         {creatingAgent ? "Creating…" : "Create & Attach"}
@@ -874,7 +921,6 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                             : "border-gray-100 hover:border-blue-200 hover:bg-blue-50/40 cursor-pointer",
                         )}
                       >
-                        <span className="text-base">🤖</span>
                         <div className="flex-1 min-w-0">
                           <p className="text-xs font-semibold text-gray-900 truncate">{a.name}</p>
                           <p className="text-[10px] text-gray-400 truncate">{a.config.role}</p>
@@ -890,13 +936,12 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
 
               {/* ── Internal tools section ─────────────────────────────────── */}
               <section>
-                <SectionHeader label="🔧 Tools" color="bg-emerald-50 text-emerald-700" count={panelTools.length} />
+                <SectionHeader label="Tools" count={panelTools.length} />
 
                 {panelTools.length === 0 && (
                   <p className="text-xs text-muted-foreground text-center py-3">No tools available.</p>
                 )}
                 {panelTools.map((tool) => {
-                  const meta = TOOL_META[tool.name] ?? { emoji: "🔧" };
                   const attached = panelConfig?.tools.includes(tool.name) ?? false;
                   const needsConfig = !!TOOL_FIELDS[tool.name]?.length;
                   const isConfigured = configuredTools.has(tool.name);
@@ -912,15 +957,14 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                           : "border-gray-100 hover:border-emerald-200 hover:bg-emerald-50/40 cursor-pointer",
                       )}
                     >
-                      <span className="text-base">{meta.emoji}</span>
                       <div className="flex-1 min-w-0">
-                        <p className="text-xs font-semibold text-gray-900">{tool.name}</p>
+                        <p className="text-xs font-semibold text-gray-900">{tool.display_name}</p>
                         <p className="text-[10px] text-gray-400 truncate">{tool.description}</p>
                       </div>
                       {attached
                         ? <span className="text-[10px] bg-emerald-100 text-emerald-600 rounded-full px-2 py-0.5 font-medium shrink-0">Attached</span>
                         : needsConfig && !isConfigured
-                          ? <span className="text-[10px] bg-amber-100 text-amber-600 rounded-full px-1.5 py-0.5 shrink-0">⚙️ Setup</span>
+                          ? <span className="text-[10px] bg-amber-100 text-amber-600 rounded-full px-1.5 py-0.5 shrink-0">Setup</span>
                           : <span className="text-gray-300 text-sm shrink-0">→</span>}
                     </button>
                   );
@@ -929,7 +973,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
 
               {/* ── MCP servers section ────────────────────────────────────── */}
               <section>
-                <SectionHeader label="🔌 MCP Servers" color="bg-amber-50 text-amber-700" count={panelMCPServers.length} />
+                <SectionHeader label="MCP Servers" count={panelMCPServers.length} />
 
                 {/* Register new MCP inline form */}
                 {!mcpRegOpen ? (
@@ -1006,7 +1050,6 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                     >
                       {/* Server header row */}
                       <div className="flex items-center gap-2 px-3 py-2">
-                        <span className="text-sm">🔌</span>
                         <div className="flex-1 min-w-0">
                           <p className="text-xs font-semibold text-gray-900 truncate">{server.name}</p>
                           <p className="text-[10px] text-gray-400 truncate font-mono">{server.url}</p>
@@ -1048,19 +1091,14 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
           <DialogContent className="max-w-sm">
             {toolConfigDlg && (() => {
               const fields = TOOL_FIELDS[toolConfigDlg.toolName] ?? [];
-              const meta = TOOL_META[toolConfigDlg.toolName] ?? { emoji: "🔧" };
+              const displayName = registryTools.find((t) => t.name === toolConfigDlg.toolName)?.display_name ?? toolConfigDlg.toolName;
               const allFilled = fields.every((f) => !f.required || toolConfigDlg.configValues[f.key]?.trim());
               return (
                 <>
                   {/* Gradient header */}
                   <div className="-mx-6 -mt-6 px-6 pt-5 pb-4 rounded-t-lg bg-gradient-to-br from-emerald-500 to-teal-600 mb-4">
-                    <div className="flex items-center gap-3">
-                      <span className="text-2xl">{meta.emoji}</span>
-                      <div>
-                        <p className="font-bold text-white text-base">{toolConfigDlg.toolName}</p>
-                        <p className="text-emerald-100 text-xs">Tool Configuration</p>
-                      </div>
-                    </div>
+                    <p className="font-bold text-white text-base">{displayName}</p>
+                    <p className="text-emerald-100 text-xs">Tool Configuration</p>
                   </div>
 
                   <p className="text-xs text-muted-foreground mb-3">
@@ -1145,17 +1183,12 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
             {/* Tool properties */}
             {propsTarget?.kind === "tool" && (() => {
               const ps = propsTarget as { toolName: string; ownerAgentId: string; description: string };
-              const meta = TOOL_META[ps.toolName] ?? { emoji: "🔧" };
+              const displayName = registryTools.find((t) => t.name === ps.toolName)?.display_name ?? ps.toolName;
               return (
                 <>
                   <div className="px-6 py-5 bg-gradient-to-br from-emerald-500 to-teal-600">
-                    <div className="flex items-center gap-3">
-                      <span className="text-3xl">{meta.emoji}</span>
-                      <div>
-                        <p className="font-bold text-white text-lg">{ps.toolName}</p>
-                        <p className="text-emerald-100 text-xs font-medium uppercase tracking-wide">Internal Tool</p>
-                      </div>
-                    </div>
+                    <p className="font-bold text-white text-lg">{displayName}</p>
+                    <p className="text-emerald-100 text-xs font-medium uppercase tracking-wide">Internal Tool</p>
                   </div>
                   <div className="p-6 space-y-5">
                     <div>
@@ -1170,7 +1203,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                           : "bg-amber-50 border-amber-200"
                       )}>
                         <p className={cn("text-xs font-bold mb-1", configuredTools.has(ps.toolName) ? "text-emerald-700" : "text-amber-700")}>
-                          {configuredTools.has(ps.toolName) ? "✓ Credentials saved" : "⚙️ Credentials required"}
+                          {configuredTools.has(ps.toolName) ? "Credentials saved" : "Credentials required"}
                         </p>
                         <p className={cn("text-xs", configuredTools.has(ps.toolName) ? "text-emerald-600" : "text-amber-600")}>
                           {configuredTools.has(ps.toolName)
@@ -1197,13 +1230,8 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
               return (
                 <>
                   <div className="px-6 py-5 bg-gradient-to-br from-amber-500 to-orange-500">
-                    <div className="flex items-center gap-3">
-                      <span className="text-3xl">🔌</span>
-                      <div>
-                        <p className="font-bold text-white text-lg">{ps.serverName}</p>
-                        <p className="text-amber-100 text-xs font-medium uppercase tracking-wide">MCP · External Server</p>
-                      </div>
-                    </div>
+                    <p className="font-bold text-white text-lg">{ps.serverName}</p>
+                    <p className="text-amber-100 text-xs font-medium uppercase tracking-wide">MCP · External Server</p>
                   </div>
                   <div className="p-6 space-y-5">
                     {server && (
@@ -1249,25 +1277,20 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                     ? "bg-gradient-to-br from-violet-600 to-purple-700"
                     : "bg-gradient-to-br from-blue-600 to-indigo-700"
                 )}>
-                  <div className="flex items-center gap-3">
-                    <span className="text-3xl">{propsTarget.kind === "root-agent" ? "🟣" : "🔵"}</span>
-                    <div>
-                      <p className="font-bold text-white text-lg">{editAgent.name}</p>
-                      <p className="text-white/70 text-xs font-medium uppercase tracking-wide">
-                        {propsTarget.kind === "root-agent" ? "Supervisor Agent" : "Sub-agent · Internal"}
-                      </p>
-                    </div>
-                  </div>
+                  <p className="font-bold text-white text-lg">{editAgent.name}</p>
+                  <p className="text-white/70 text-xs font-medium uppercase tracking-wide">
+                    {propsTarget.kind === "root-agent" ? "Supervisor Pipeline" : "Sub Agent"}
+                  </p>
                   {/* Quick stats */}
                   <div className="flex gap-3 mt-3">
                     <span className="text-xs text-white/80 bg-white/10 rounded-full px-2.5 py-1">
-                      🔧 {editAgent.config.tools.length} tools
+                      {editAgent.config.tools.length} tools
                     </span>
                     <span className="text-xs text-white/80 bg-white/10 rounded-full px-2.5 py-1">
-                      🌡 {editAgent.config.llm.temperature}
+                      temp {editAgent.config.llm.temperature}
                     </span>
                     <span className="text-xs text-white/80 bg-white/10 rounded-full px-2.5 py-1">
-                      🧠 {editAgent.config.memory.type}
+                      memory: {editAgent.config.memory.type}
                     </span>
                   </div>
                 </div>

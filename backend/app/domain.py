@@ -1,27 +1,18 @@
 """All domain schemas + typed errors in one file.
 
 Pydantic for anything that crosses a serialization boundary (DB rows, HTTP
-bodies, SSE events). Dataclasses for pure-runtime types (ToolContext,
-ToolResult). BaseTool is an ABC.
-
-KISS: only fields that have a caller today, plus the few sub-models that
-TASK.md asks for and that map cleanly to UI form sections.
+bodies, SSE events). Tool types live in LangChain (BaseTool); no custom
+ToolSpec / ToolContext / ToolResult here.
 """
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-
-# ---------------------------------------------------------------------------
-# Base + helpers
-# ---------------------------------------------------------------------------
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -30,10 +21,6 @@ def utcnow() -> datetime:
 class _Base(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-
-# ---------------------------------------------------------------------------
-# Users, personas, chats
-# ---------------------------------------------------------------------------
 
 class User(_Base):
     id: UUID = Field(default_factory=uuid4)
@@ -44,21 +31,21 @@ class User(_Base):
 
 
 class Persona(_Base):
-    """Per-(agent, user) system-prompt override. user_id=None = default."""
+    """Named system_prompt. user_id=None = global (read-only); otherwise owned by that user."""
 
     id: UUID = Field(default_factory=uuid4)
-    agent_id: UUID
     user_id: UUID | None = None
-    system_prompt_override: str
+    name: str
+    system_prompt: str
 
 
 class Chat(_Base):
-    """Persistent conversational thread. Exactly one of agent_id/workflow_id set."""
+    """Conversational thread. persona_id, when set, overrides the agent's system_prompt at run time."""
 
     id: UUID = Field(default_factory=uuid4)
     user_id: UUID
-    agent_id: UUID | None = None
-    workflow_id: UUID | None = None
+    agent_id: UUID
+    persona_id: UUID | None = None
     channel: Literal["web", "slack"] = "web"
     external_thread_id: str | None = None
     title: str | None = None
@@ -66,24 +53,33 @@ class Chat(_Base):
     updated_at: datetime = Field(default_factory=utcnow)
 
 
-# ---------------------------------------------------------------------------
-# Agent config — TASK.md's dimensions, nothing more
-# ---------------------------------------------------------------------------
-
 class LLMConfig(_Base):
     """OpenAI-compatible — vLLM, OpenAI, Gemini-via-proxy all fit."""
 
     base_url: str
     api_key: str = "EMPTY"
     model: str
-    temperature: float = 0.2
+    # Default tuned for reasoning models (Qwen3.5, DeepSeek-R1, etc.) which need
+    # ≥0.6 to avoid degenerate output. Override per-agent for non-reasoning models.
+    temperature: float = 0.7
     max_tokens: int = 1024
     timeout_s: float = 30.0
 
 
 class MemoryConfig(_Base):
-    type: Literal["none", "buffer", "summary"] = "buffer"
-    window: int = 20
+    """Rolling summary memory.
+
+    type="summary" (default): keep `window` (N) most-recent messages verbatim; once
+    unsummarized count exceeds N + `summary_threshold` (M), fold the oldest M into a
+    rolling summary stored on ChatDB. N < M by design: verbatim is expensive per
+    message; batched summarization minimises LLM round-trips.
+    type="buffer": last-N only, no summary.
+    type="none": pass all history (debugging / short chats).
+    """
+
+    type: Literal["none", "buffer", "summary"] = "summary"
+    window: int = 10  # N — verbatim tail
+    summary_threshold: int = 20  # M — unsummarized batch size before fold
 
 
 class Limits(_Base):
@@ -108,7 +104,7 @@ class AgentConfig(_Base):
     description: str | None = None
     system_prompt: str
     llm: LLMConfig
-    tools: list[str] = Field(default_factory=lambda: ["plan"])  # planner auto-attached, removable
+    tools: list[str] = Field(default_factory=list)  # tool names from app.runtime.tools.REGISTRY
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     limits: Limits = Field(default_factory=Limits)
     guardrails: Guardrails = Field(default_factory=Guardrails)
@@ -122,57 +118,6 @@ class AgentConfig(_Base):
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
-
-# ---------------------------------------------------------------------------
-# Tool contract — uniform across plain tools and (future) agent-as-tool
-# ---------------------------------------------------------------------------
-
-class ToolSpec(_Base):
-    """LLM-visible tool description. JSON-Schema params (OpenAI-compatible)."""
-
-    name: str
-    description: str
-    parameters: dict[str, Any]
-    needs_approval: bool = False
-    tags: list[str] = Field(default_factory=list)
-
-
-@dataclass
-class ToolResult:
-    output: Any
-    success: bool = True
-    error: str | None = None
-
-
-EmitEvent = Callable[["RunEvent"], Awaitable[None]]
-
-
-@dataclass
-class ToolContext:
-    """Runtime context handed to every tool. Not serialized."""
-
-    run_id: UUID
-    chat_id: UUID
-    agent_id: UUID
-    user_id: UUID
-    emit: EmitEvent
-    llm: Any = None     # LLMClient — typed in caller to avoid circular import
-    http: Any = None    # httpx.AsyncClient
-    extra: dict[str, Any] = field(default_factory=dict)
-
-
-class BaseTool(ABC):
-    """All tools — Tavily, calculator, planner, future agent-as-tool — share this."""
-
-    spec: ToolSpec
-
-    @abstractmethod
-    async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult: ...
-
-
-# ---------------------------------------------------------------------------
-# Workflow graph (React Flow shape — stored verbatim, compiled by runtime)
-# ---------------------------------------------------------------------------
 
 NodeType = Literal["start", "agent", "tool", "condition", "human", "end"]
 
@@ -204,10 +149,6 @@ class WorkflowDef(_Base):
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
-
-# ---------------------------------------------------------------------------
-# Messages + runs + events
-# ---------------------------------------------------------------------------
 
 MessageSender = str  # "user" | "system" | agent UUID string
 
@@ -266,10 +207,6 @@ class RunEvent(_Base):
     type: EventType
     data: dict[str, Any] = Field(default_factory=dict)
 
-
-# ---------------------------------------------------------------------------
-# Typed errors
-# ---------------------------------------------------------------------------
 
 class AppError(Exception):
     """Base for all domain/runtime errors."""

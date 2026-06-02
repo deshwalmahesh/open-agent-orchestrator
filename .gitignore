@@ -11,3 +11,5 @@ dist/
 build/
 .DS_Store
 .claude/
+*.db
+*.db-journal

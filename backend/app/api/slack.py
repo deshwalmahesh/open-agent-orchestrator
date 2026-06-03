@@ -10,7 +10,7 @@ import asyncio
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +26,10 @@ class SlackConnectBody(BaseModel):
     bot_token: str   # xoxb-...
     app_token: str   # xapp-...
     agent_id: str | None = None  # if set, this pipeline becomes the single Slack-active one
+
+
+class SlackActiveBody(BaseModel):
+    agent_id: str
 
 
 async def _apply_single_slack_binding(
@@ -116,6 +120,23 @@ async def connect(
 
     active = await _active_slack_agent_id(session, user_id=user.id)
     return {"connected": True, "active_agent_id": str(active) if active else None}
+
+
+@router.post("/active")
+async def set_active(
+    body: SlackActiveBody,
+    user: Annotated[UserDB, Depends(current_active_user)],
+    session: Annotated[AsyncSession, Depends(get_async_session)],
+) -> dict:
+    """Switch which pipeline owns the Slack binding for this user. No token
+    change, no adapter restart — just swaps the ChannelBinding atomically."""
+    try:
+        agent_uuid = UUID(body.agent_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid agent_id")
+    await _apply_single_slack_binding(session, user_id=user.id, active_agent_id=agent_uuid)
+    active = await _active_slack_agent_id(session, user_id=user.id)
+    return {"active_agent_id": str(active) if active else None}
 
 
 @router.post("/disconnect")

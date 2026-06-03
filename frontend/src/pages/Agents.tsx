@@ -7,7 +7,7 @@ import { cn, isPipelineRoot } from "@/lib/utils";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import AgentForm from "@/components/AgentForm";
 import { listAgents, createAgent, updateAgent, deleteAgent } from "@/api/agents";
-import { getSlackStatus } from "@/api/slack";
+import { getSlackStatus, setSlackActive } from "@/api/slack";
 import { useAuth } from "@/hooks/useAuth";
 import { getLLMDefaults } from "@/lib/llm-defaults";
 import type { Agent, AgentConfig } from "@/types";
@@ -62,6 +62,12 @@ export default function Agents() {
     mutationFn: (id: string) => deleteAgent(token!, id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["agents"] }),
     onError: (err) => console.error("Delete agent failed:", err),
+  });
+
+  const setActiveMut = useMutation({
+    mutationFn: (id: string) => setSlackActive(token!, id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["slack-status"] }),
+    onError: (err) => console.error("Set Slack-active failed:", err),
   });
 
   // No dialog — click → create with defaults → open canvas immediately
@@ -126,7 +132,7 @@ export default function Agents() {
           {pipelines.map((agent) => (
             <div
               key={agent.id}
-              className="flex items-center gap-3 border rounded-xl p-4 hover:bg-violet-50/40 hover:border-violet-200 transition-colors"
+              className="group flex items-center gap-3 border rounded-xl p-4 hover:bg-violet-50/40 hover:border-violet-200 transition-colors"
             >
               <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center text-white font-bold text-sm shrink-0">
                 {agent.name.slice(0, 2).toUpperCase()}
@@ -162,6 +168,17 @@ export default function Agents() {
                 </div>
               </div>
               <div className="flex items-center gap-1.5 shrink-0">
+                {agent.id !== slackActiveId && slackStatus?.connected && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-xs text-emerald-700 hover:text-emerald-800 hover:bg-emerald-50 opacity-0 group-hover:opacity-100 transition-opacity"
+                    disabled={setActiveMut.isPending}
+                    onClick={() => setActiveMut.mutate(agent.id)}
+                  >
+                    {setActiveMut.isPending && setActiveMut.variables === agent.id ? "Switching…" : "Make Slack-active"}
+                  </Button>
+                )}
                 <Link
                   to={`/agents/${agent.id}/canvas`}
                   className={cn(buttonVariants({ variant: "default", size: "sm" }), "bg-violet-600 hover:bg-violet-700 text-white text-xs")}

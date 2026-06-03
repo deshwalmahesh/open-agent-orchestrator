@@ -19,3 +19,14 @@ export async function connectSlack(
 export async function disconnectSlack(token: string): Promise<{ connected: boolean }> {
   return apiFetch("/slack/disconnect", { method: "POST" }, token);
 }
+
+export async function setSlackActive(
+  token: string,
+  agentId: string,
+): Promise<{ active_agent_id: string | null }> {
+  return apiFetch(
+    "/slack/active",
+    { method: "POST", body: JSON.stringify({ agent_id: agentId }) },
+    token,
+  );
+}

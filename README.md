@@ -209,6 +209,30 @@ Either set `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN` in `.env` (auto-starts in lifes
 
 To link your Slack identity: `PATCH /users/me {"slack_user_id":"U..."}`.
 
+### Deploy (single-image, any Docker host)
+
+The root `Dockerfile` builds the frontend to `static/` and bakes it into the backend image — one container serves both. Works on any host that builds Dockerfiles. Binds to `${PORT:-8000}`.
+
+```bash
+docker build -t agent-orchestrator .
+docker run -p 8000:8000 -e JWT_SECRET=$(openssl rand -hex 32) agent-orchestrator
+```
+
+**That's it.** LLM credentials (provider / base_url / api_key / model) are entered by each user in the browser when they create a pipeline (BYOK, kept in their localStorage + saved into their `AgentConfig.llm`). The server never holds them.
+
+**Operator-set env:**
+- `JWT_SECRET` — **required.** Stable secret used to sign user JWTs. Generate once with `openssl rand -hex 32` and reuse across redeploys (rotating it logs everyone out). Leaving it unset uses an insecure default and forfeits auth integrity.
+
+**Operator-optional env:**
+- `DATABASE_URL` — defaults to SQLite at `./dev.db`. For persistence across redeploys, swap to managed Postgres: `postgresql+asyncpg://user:pass@host:5432/db`.
+- `REDIS_URL` — defaults to empty. Without Redis, runs still execute but lose within-run LangGraph checkpoints (fine for stateless chat; needed for future HITL).
+- `TAVILY_API_KEY` — platform-wide `web_search` credential. Users can also bring their own via `/tool-configs`.
+- `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN` — auto-start Slack at boot. If unset, the first user to connect via `/integrations` owns the platform bot.
+
+**Caveats:**
+- SQLite + ephemeral container disk = data lost on every redeploy. Attach a volume at `/app/` (or `/app/dev.db`) or use managed Postgres.
+- Slack uses outbound WebSocket (Socket Mode) — needs a host that keeps long-running processes alive (no idle-sleep tiers).
+
 ---
 
 ## API

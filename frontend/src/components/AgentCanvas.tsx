@@ -1284,7 +1284,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
 
             {/* MCP properties */}
             {propsTarget?.kind === "mcp" && (() => {
-              const ps = propsTarget as { serverId: string; serverName: string };
+              const ps = propsTarget as { serverId: string; serverName: string; ownerAgentId: string };
               const server = mcpServers.find((s) => s.id === ps.serverId);
               const discovered = mcpToolsMap[ps.serverId]?.tools ?? [];
               return (

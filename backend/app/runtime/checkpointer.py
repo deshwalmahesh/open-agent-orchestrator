@@ -19,6 +19,8 @@ async def build_checkpointer() -> tuple[AsyncRedisSaver, AsyncRedis]:
     whether to degrade or crash.
     """
     redis_url = get_settings().redis_url
+    if not redis_url:
+        raise RuntimeError("REDIS_URL not configured — checkpointer disabled")
     log.info("checkpointer.connecting", redis_url=redis_url)
     client = AsyncRedis.from_url(redis_url)
     # Round-trip ping forces the connection NOW so failure surfaces here, not

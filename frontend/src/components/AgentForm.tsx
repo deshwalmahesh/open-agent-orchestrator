@@ -15,7 +15,7 @@ import { listProviders } from "@/api/providers";
 import { useAuth } from "@/hooks/useAuth";
 import { cn, isPipelineRoot } from "@/lib/utils";
 import { getLLMDefaults, saveLLMDefaults } from "@/lib/llm-defaults";
-import type { Agent, AgentConfig, Persona } from "@/types";
+import type { Agent, AgentConfig, LLMProvider, Persona } from "@/types";
 
 // ─── Zod schema ───────────────────────────────────────────────────────────────
 // system_prompt is no longer a form field — it's derived from the picked persona
@@ -208,7 +208,7 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
   async function onValid(values: FormValues) {
     // Persist LLM settings so new agents / sub-agents pre-fill from them
     saveLLMDefaults({
-      provider: values.llm_provider,
+      provider: values.llm_provider as LLMProvider,
       base_url: values.llm_base_url,
       api_key: values.llm_api_key,
       model: values.llm_model,

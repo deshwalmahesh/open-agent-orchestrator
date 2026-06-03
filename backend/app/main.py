@@ -113,6 +113,7 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 
 
 def create_app() -> FastAPI:
+    from pathlib import Path
     app = FastAPI(
         title="AI Agent Orchestration Platform",
         version="0.1.0",
@@ -153,6 +154,21 @@ def create_app() -> FastAPI:
     app.include_router(tool_configs_router)
     app.include_router(chats_router)
     app.include_router(runs_router)
+
+    # Serve built frontend in prod (Dockerfile copies dist → /app/static).
+    # Mounted AFTER API routes so they always win. SPA fallback: unknown paths
+    # return index.html and let React Router handle them client-side.
+    static_dir = Path(__file__).resolve().parent.parent / "static"
+    if static_dir.is_dir():
+        from starlette.responses import FileResponse
+
+        @app.get("/{full_path:path}", include_in_schema=False)
+        async def spa_fallback(full_path: str):
+            file = (static_dir / full_path).resolve()
+            if file.is_relative_to(static_dir.resolve()) and file.is_file():
+                return FileResponse(file)
+            return FileResponse(static_dir / "index.html")
+
     return app
 
 

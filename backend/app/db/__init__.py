@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from pathlib import Path
 
 import structlog
+import yaml
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -65,29 +67,37 @@ async def create_all() -> None:
                 pass
 
 
-_DEFAULT_SUPERVISOR_PROMPT = (
-    "You are a supervisor agent. Coordinate sub-agents and tools to solve the user's task. "
-    "Delegate to a sub-agent when its role matches; call a tool when needed. "
-    "Be concise, accurate, and decisive."
-)
+_PERSONAS_YAML = Path(__file__).parent / "seeds" / "personas.yaml"
 
 
 async def seed_defaults() -> None:
-    """Seed read-only global rows that every workspace expects (user_id IS NULL).
-    Idempotent — safe to call on every startup. Currently: one Default Supervisor persona."""
+    """Seed/refresh global personas (user_id IS NULL) from seeds/personas.yaml.
+
+    Idempotent. For each YAML entry: insert if missing, or update the row's
+    system_prompt if it has diverged from the YAML (the file is the source of
+    truth — editing it is how bundled prompts evolve, no migration needed).
+    Name is the natural key."""
     from sqlalchemy import select
 
     from app.db.models import PersonaDB
 
+    entries = yaml.safe_load(_PERSONAS_YAML.read_text())
+    if not entries:
+        return
+
     async with get_session_factory()() as session:
-        existing = (await session.execute(
-            select(PersonaDB).where(
-                PersonaDB.user_id.is_(None),
-                PersonaDB.name == "Default Supervisor",
-            )
-        )).scalar_one_or_none()
-        if existing is not None:
-            return
-        session.add(PersonaDB(user_id=None, name="Default Supervisor", system_prompt=_DEFAULT_SUPERVISOR_PROMPT))
+        for entry in entries:
+            name = entry["name"]
+            prompt = entry["system_prompt"]
+            row = (await session.execute(
+                select(PersonaDB).where(
+                    PersonaDB.user_id.is_(None), PersonaDB.name == name,
+                )
+            )).scalar_one_or_none()
+            if row is None:
+                session.add(PersonaDB(user_id=None, name=name, system_prompt=prompt))
+                log.info("db.seed.persona_created", name=name)
+            elif row.system_prompt != prompt:
+                row.system_prompt = prompt
+                log.info("db.seed.persona_updated", name=name)
         await session.commit()
-        log.info("db.seed.default_persona_created")

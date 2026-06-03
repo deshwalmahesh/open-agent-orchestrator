@@ -18,6 +18,7 @@ from uuid import UUID
 
 import structlog
 from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.errors import GraphRecursionError
 from pypdf import PdfReader
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,7 +33,7 @@ from app.db.repos import (
 )
 from app.domain import AgentConfig, LLMConfig
 from app.llm import build_chat_model, invoke_with_retry
-from app.runtime.agent import build_agent_tree
+from app.runtime.agent import _SUBAGENT_USAGE, _accumulate_usage, build_agent_tree
 from app.runtime.events import EMITTERS, RunEventEmitter
 from app.runtime.tools import build_registry
 
@@ -116,12 +117,7 @@ async def _resolve_context(session, chat: ChatDB, cfg: AgentConfig):
 def _extract_usage(result_messages: list) -> dict:
     """Sum usage_metadata across any AIMessages in the result (covers multi-step ReAct)."""
     totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-    for m in result_messages:
-        usage = getattr(m, "usage_metadata", None)
-        if not usage:
-            continue
-        for k in totals:
-            totals[k] += usage.get(k, 0) or 0
+    _accumulate_usage(totals, result_messages)
     return totals
 
 
@@ -230,18 +226,27 @@ async def _execute(run_id: UUID, chat_id: UUID, user_text: str, files: list[dict
         )
         # thread_id = run_id (not chat_id) — each run gets its own checkpoint so
         # within-run graph state doesn't conflict with our DB-based cross-turn history.
-        result = await invoke_with_retry(
-            agent,
-            {"messages": lc_messages},
-            config={
-                "recursion_limit": max(2, cfg.limits.max_steps),
-                "configurable": {"thread_id": str(run_id)},
-            },
-        )
+        # Sub-agent token usage is collected via _SUBAGENT_USAGE contextvar (root's
+        # result["messages"] only sees ToolMessages for sub-agent calls, no usage).
+        sub_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        usage_token = _SUBAGENT_USAGE.set(sub_usage)
+        try:
+            result = await invoke_with_retry(
+                agent,
+                {"messages": lc_messages},
+                config={
+                    "recursion_limit": max(2, cfg.limits.max_steps),
+                    "configurable": {"thread_id": str(run_id)},
+                },
+            )
+        finally:
+            _SUBAGENT_USAGE.reset(usage_token)
 
         final = result["messages"][-1]
         reply = getattr(final, "content", "") or ""
         usage = _extract_usage(result["messages"])
+        for k in usage:
+            usage[k] += sub_usage.get(k, 0)
 
         # Phase 3: post-LLM persistence — fresh session, sender_id captured in Phase 1.
         async with session_factory() as session:
@@ -260,6 +265,27 @@ async def _execute(run_id: UUID, chat_id: UUID, user_text: str, files: list[dict
         await emitter.emit("agent.message", {"sender": sender_id, "content": reply})
         await emitter.emit("run.finished", {"usage": usage, "status": "succeeded"})
         log.info("run.succeeded", run_id=str(run_id), tokens=usage.get("total_tokens", 0))
+    except GraphRecursionError:
+        # Bounded step budget reached. Don't leave the chat silent — persist a clean
+        # reply so the user sees something actionable. Run is still marked failed
+        # so usage/billing accounting stays honest.
+        limit = cfg.limits.max_steps  # captured during Phase 1
+        log.warning("run.recursion_limit", run_id=str(run_id), limit=limit)
+        reply = (
+            f"I couldn't finish this within {limit} reasoning steps. "
+            f"Could you simplify the request or split it into smaller parts?"
+        )
+        async with session_factory() as session:
+            await insert_message(
+                session, chat_id=chat_id, run_id=run_id,
+                sender=sender_id, recipient="user", content=reply,
+            )
+            await finalize_run(
+                session, run_id=run_id, status="failed",
+                error=f"recursion limit ({limit}) exceeded",
+            )
+        await emitter.emit("agent.message", {"sender": sender_id, "content": reply})
+        await emitter.emit("run.finished", {"status": "failed", "error": "recursion_limit"})
     except Exception as exc:  # noqa: BLE001 — top-level boundary; we log + persist
         log.exception("run.failed", run_id=str(run_id), error=str(exc))
         async with session_factory() as session:

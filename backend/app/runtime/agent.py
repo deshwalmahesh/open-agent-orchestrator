@@ -14,12 +14,15 @@ breaks bind_tools, can't be the model arg."""
 
 from __future__ import annotations
 
+import contextvars
+
 import structlog
 from langchain.agents import create_agent
 from langchain.tools import tool as tool_decorator
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -31,6 +34,24 @@ from app.runtime.tools import get_tools
 log = structlog.get_logger()
 
 MAX_AGENT_DEPTH = 4
+
+# Accumulator for sub-agent token usage. Parent's result["messages"] only contains
+# ToolMessage(content=sub_reply_str) with no usage_metadata, so sub-agent LLM tokens
+# would vanish from root run.usage. Root sets this before invoke; every _delegate
+# at any depth adds its own messages' usage into the same dict. asyncio.create_task
+# copies the current Context, so nested levels see the same accumulator.
+_SUBAGENT_USAGE: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "subagent_usage", default=None
+)
+
+
+def _accumulate_usage(target: dict, messages: list) -> None:
+    for m in messages:
+        usage = getattr(m, "usage_metadata", None)
+        if not usage:
+            continue
+        for k in ("input_tokens", "output_tokens", "total_tokens"):
+            target[k] = target.get(k, 0) + (usage.get(k, 0) or 0)
 
 
 def _make_subagent_tool(
@@ -51,11 +72,23 @@ def _make_subagent_tool(
         sub_agent = await build_agent_tree(
             sub_cfg, depth=depth + 1, session_factory=session_factory, tool_registry=tool_registry,
         )
-        result = await invoke_with_retry(
-            sub_agent,
-            {"messages": [HumanMessage(content=task)]},
-            config={"recursion_limit": max(2, sub_cfg.limits.max_steps)},
-        )
+        try:
+            result = await invoke_with_retry(
+                sub_agent,
+                {"messages": [HumanMessage(content=task)]},
+                config={"recursion_limit": max(2, sub_cfg.limits.max_steps)},
+            )
+        except GraphRecursionError:
+            # Don't raise — let the parent LLM react to this as a tool result.
+            log.warning("subagent.recursion_limit", agent=sub_cfg.name, limit=sub_cfg.limits.max_steps)
+            return (
+                f"[Sub-agent '{sub_cfg.name}' could not complete within "
+                f"{sub_cfg.limits.max_steps} steps. The task may be too broad — "
+                f"try splitting it or asking with more specifics.]"
+            )
+        accum = _SUBAGENT_USAGE.get()
+        if accum is not None:
+            _accumulate_usage(accum, result["messages"])
         return getattr(result["messages"][-1], "content", "") or ""
 
     return _delegate

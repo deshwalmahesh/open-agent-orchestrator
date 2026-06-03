@@ -7,7 +7,10 @@ export interface User {
   plan: "free" | "paid" | "admin";
 }
 
+export type LLMProvider = "openai" | "anthropic" | "google" | "vllm";
+
 export interface LLMConfig {
+  provider: LLMProvider;
   base_url: string;
   api_key: string;
   model: string;
@@ -78,6 +81,8 @@ export interface Chat {
   channel: "web" | "slack";
   external_thread_id?: string | null;
   title?: string | null;
+  // Snippet of the first user message — populated by /chats list, undefined elsewhere.
+  preview?: string | null;
   created_at: string;
   updated_at: string;
 }

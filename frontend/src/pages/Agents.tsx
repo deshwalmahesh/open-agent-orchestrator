@@ -22,7 +22,7 @@ function buildDefaultConfig(name: string, supervisorPrompt: string): AgentConfig
     role: "supervisor",
     description: null,
     system_prompt: supervisorPrompt,
-    llm: { base_url: llm.base_url, api_key: llm.api_key, model: llm.model, temperature: llm.temperature, max_tokens: llm.max_tokens, timeout_s: 30.0 },
+    llm: { provider: llm.provider, base_url: llm.base_url, api_key: llm.api_key, model: llm.model, temperature: llm.temperature, max_tokens: llm.max_tokens, timeout_s: 30.0 },
     tools: [],
     memory: { type: "summary", window: 10, summary_threshold: 20 },
     limits: { max_steps: 8 },

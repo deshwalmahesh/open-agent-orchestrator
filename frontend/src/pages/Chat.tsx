@@ -135,29 +135,59 @@ export default function ChatPage() {
         </div>
         <ScrollArea className="flex-1">
           {chats.length === 0 ? (
-            <p className="p-3 text-xs text-muted-foreground">No chats yet.</p>
+            <p className="p-4 text-xs text-zinc-400 italic">No chats yet.</p>
           ) : (
             chatGroups.map(({ key, agentName, chats: groupChats }) => (
               <div key={key}>
-                {/* Agent group header */}
-                <div className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-muted-foreground bg-muted/40 border-b sticky top-0 z-10 truncate">
+                {/* Agent group header — slim, neutral */}
+                <div className="px-3 py-1.5 text-[9px] font-bold uppercase tracking-[0.18em] text-zinc-400 bg-zinc-50/60 border-b border-zinc-100 sticky top-0 z-10 truncate">
                   {agentName}
                 </div>
-                {groupChats.map((chat) => (
-                  <button
-                    key={chat.id}
-                    onClick={() => navigate(`/chats/${chat.id}`)}
-                    className={cn(
-                      "w-full text-left px-3 py-2 text-sm hover:bg-accent/40 transition-colors border-b last:border-0",
-                      chat.id === activeId && "bg-accent",
-                    )}
-                  >
-                    <div className="font-medium truncate">{chat.title ?? "Chat"}</div>
-                    <div className="text-xs text-muted-foreground truncate">
-                      {new Date(chat.updated_at).toLocaleDateString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                {groupChats.map((chat) => {
+                  const isActive = chat.id === activeId;
+                  const title = chat.title?.trim() || "Untitled";
+                  const preview = chat.preview?.trim();
+                  return (
+                    <div
+                      key={chat.id}
+                      className={cn(
+                        "group/chat relative border-b border-zinc-100 last:border-0 transition-colors",
+                        isActive ? "bg-violet-50" : "hover:bg-zinc-50",
+                      )}
+                    >
+                      <button
+                        onClick={() => navigate(`/chats/${chat.id}`)}
+                        className="w-full text-left px-3 py-2.5 pr-8"
+                      >
+                        <div className={cn(
+                          "text-sm font-medium truncate leading-tight",
+                          isActive ? "text-violet-900" : "text-zinc-800",
+                        )}>{title}</div>
+                        {preview ? (
+                          <div className="text-[11px] text-zinc-500 truncate mt-0.5 leading-snug">{preview}</div>
+                        ) : (
+                          <div className="text-[11px] text-zinc-400 italic mt-0.5">No messages yet</div>
+                        )}
+                        <div className="text-[10px] text-zinc-400 mt-1 font-mono">
+                          {new Date(chat.updated_at).toLocaleDateString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                        </div>
+                      </button>
+                      {/* Hover-only delete (no full-row click; doesn't navigate) */}
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (confirm(`Delete chat "${title}"? This cannot be undone.`)) {
+                            deleteChat_.mutate(chat.id);
+                          }
+                        }}
+                        title="Delete chat"
+                        className="absolute top-2.5 right-2 size-6 rounded-md text-zinc-400 hover:text-red-500 hover:bg-red-50 flex items-center justify-center text-sm opacity-0 group-hover/chat:opacity-100 transition-opacity"
+                      >
+                        ×
+                      </button>
                     </div>
-                  </button>
-                ))}
+                  );
+                })}
               </div>
             ))
           )}
@@ -172,20 +202,25 @@ export default function ChatPage() {
           </div>
         ) : (
           <>
-            {/* Chat header */}
-            <div className="px-4 py-3 border-b flex items-center gap-2">
-              <span className="font-medium">{activeChat.title ?? "Chat"}</span>
-              {activeChat.agent_name && (
-                <Badge variant="secondary" className="text-xs">{activeChat.agent_name}</Badge>
-              )}
-              <div className="flex-1" />
-              <Button variant="ghost" size="sm" onClick={() => setReassignOpen(true)}>
+            {/* Chat header — calm, single row, neutral type */}
+            <div className="px-5 py-3 border-b border-zinc-100 flex items-center gap-3 bg-white">
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-semibold text-zinc-900 truncate leading-tight">
+                  {activeChat.title?.trim() || "Untitled"}
+                </p>
+                {activeChat.agent_name && (
+                  <p className="text-[11px] text-zinc-500 mt-0.5 truncate">
+                    <span className="text-zinc-400">via</span> {activeChat.agent_name}
+                  </p>
+                )}
+              </div>
+              <Button variant="ghost" size="sm" className="text-xs text-zinc-600" onClick={() => setReassignOpen(true)}>
                 Reassign
               </Button>
               <Button
                 variant="ghost"
                 size="sm"
-                className="text-destructive hover:text-destructive"
+                className="text-xs text-zinc-500 hover:text-red-500 hover:bg-red-50"
                 onClick={() => {
                   if (confirm("Delete this chat?")) deleteChat_.mutate(activeId!);
                 }}
@@ -207,28 +242,36 @@ export default function ChatPage() {
             {/* SSE events panel */}
             <RunEventsPanel events={runEvents} isRunning={isRunning} />
 
-            {/* Input */}
-            <div className="p-3 border-t space-y-2">
-              {files.length > 0 && (
-                <div className="flex flex-wrap gap-1.5">
-                  {files.map((f, i) => (
-                    <span
-                      key={i}
-                      className="flex items-center gap-1 bg-muted text-xs px-2 py-1 rounded-md"
-                    >
-                      {f.name}
-                      <button
-                        type="button"
-                        className="text-muted-foreground hover:text-foreground ml-0.5"
-                        onClick={() => setFiles((prev) => prev.filter((_, j) => j !== i))}
+            {/* Compose bar — single rounded panel; attach + send live inside */}
+            <div className="px-5 pt-3 pb-4 bg-white border-t border-zinc-100">
+              <div
+                className={cn(
+                  "rounded-2xl border bg-white transition-colors",
+                  sending || isRunning
+                    ? "border-zinc-200 opacity-70"
+                    : "border-zinc-200 focus-within:border-violet-400 focus-within:ring-2 focus-within:ring-violet-100",
+                )}
+              >
+                {files.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 px-3 pt-2.5">
+                    {files.map((f, i) => (
+                      <span
+                        key={i}
+                        className="inline-flex items-center gap-1.5 bg-zinc-100 text-zinc-700 text-[11px] px-2 py-0.5 rounded-md font-medium"
                       >
-                        ×
-                      </button>
-                    </span>
-                  ))}
-                </div>
-              )}
-              <div className="flex gap-2">
+                        <span className="text-zinc-400">↳</span>
+                        {f.name}
+                        <button
+                          type="button"
+                          className="text-zinc-400 hover:text-red-500 -mr-0.5"
+                          onClick={() => setFiles((prev) => prev.filter((_, j) => j !== i))}
+                        >
+                          ×
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -241,31 +284,36 @@ export default function ChatPage() {
                     e.target.value = "";
                   }}
                 />
-                <button
-                  type="button"
-                  title="Attach image or PDF"
-                  className="self-end p-2 rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors disabled:opacity-40"
-                  disabled={sending || isRunning}
-                  onClick={() => fileInputRef.current?.click()}
-                >
-                  📎
-                </button>
                 <Textarea
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={handleKeyDown}
-                  placeholder="Type a message… (Ctrl+Enter to send)"
+                  placeholder="Type a message…"
                   rows={2}
-                  className="flex-1 resize-none"
+                  className="border-0 shadow-none focus-visible:ring-0 resize-none px-3.5 py-2.5 text-sm leading-relaxed"
                   disabled={sending || isRunning}
                 />
-                <Button
-                  onClick={handleSend}
-                  disabled={sending || isRunning || !input.trim()}
-                  className="self-end"
-                >
-                  {sending ? "…" : "Send"}
-                </Button>
+                <div className="flex items-center px-2 pb-2">
+                  <button
+                    type="button"
+                    title="Attach image or PDF"
+                    className="size-8 rounded-lg text-zinc-400 hover:text-zinc-700 hover:bg-zinc-50 transition-colors disabled:opacity-40 flex items-center justify-center"
+                    disabled={sending || isRunning}
+                    onClick={() => fileInputRef.current?.click()}
+                  >
+                    <span className="text-base leading-none">+</span>
+                  </button>
+                  <div className="flex-1" />
+                  <span className="text-[10px] text-zinc-400 mr-2 font-mono">⌘↵</span>
+                  <Button
+                    onClick={handleSend}
+                    disabled={sending || isRunning || !input.trim()}
+                    size="sm"
+                    className="bg-violet-600 hover:bg-violet-700 text-white px-3 h-8 text-xs font-semibold"
+                  >
+                    {sending || isRunning ? "Sending…" : "Send"}
+                  </Button>
+                </div>
               </div>
             </div>
           </>
@@ -297,11 +345,18 @@ export default function ChatPage() {
 function MessageBubble({ msg }: { msg: Message }) {
   const isUser = msg.sender === "user";
   return (
-    <div className={cn("flex", isUser ? "justify-end" : "justify-start")}>
+    <div className={cn("flex gap-2.5", isUser ? "justify-end" : "justify-start")}>
+      {!isUser && (
+        <div className="size-7 rounded-full bg-violet-100 border border-violet-200 flex items-center justify-center text-[10px] font-bold tracking-wider text-violet-700 shrink-0 mt-0.5">
+          AI
+        </div>
+      )}
       <div
         className={cn(
-          "max-w-[75%] rounded-xl px-3 py-2 text-sm whitespace-pre-wrap",
-          isUser ? "bg-primary text-primary-foreground" : "bg-muted",
+          "max-w-[78%] rounded-2xl px-3.5 py-2.5 text-sm whitespace-pre-wrap leading-relaxed",
+          isUser
+            ? "bg-violet-600 text-white rounded-tr-md"
+            : "bg-white text-zinc-800 border border-zinc-200 rounded-tl-md shadow-sm",
         )}
       >
         {msg.content}
@@ -384,11 +439,12 @@ function NewChatDialog({
   token: string;
   onCreated: (id: string) => void;
 }) {
+  const navigate = useNavigate();
   const [agentId, setAgentId] = useState("");
   const [title, setTitle] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
-  const { data: agents = [] } = useQuery({
+  const { data: agents = [], isLoading: agentsLoading } = useQuery({
     queryKey: ["agents"],
     queryFn: () => listAgents(token),
     enabled: open,
@@ -396,6 +452,7 @@ function NewChatDialog({
 
   // New chat picks a pipeline (root), not an internal sub-agent.
   const pipelines = agents.filter((a) => isPipelineRoot(a, agents));
+  const noPipelines = !agentsLoading && pipelines.length === 0;
 
   async function handleCreate() {
     if (!agentId) return;
@@ -420,28 +477,56 @@ function NewChatDialog({
         <DialogHeader>
           <DialogTitle>New Chat</DialogTitle>
         </DialogHeader>
-        <div className="space-y-4">
-          <div className="space-y-1">
-            <Label>Pipeline *</Label>
-            <Select value={agentId} onValueChange={(v: string | null) => setAgentId(v ?? "")}>
-              <SelectTrigger><SelectValue placeholder="Select pipeline" /></SelectTrigger>
-              <SelectContent>
-                {pipelines.map((a) => (
-                  <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+        {noPipelines ? (
+          <div className="py-6 text-center space-y-4">
+            <div>
+              <p className="text-sm font-medium text-zinc-900">No pipelines yet</p>
+              <p className="text-xs text-zinc-500 mt-1">
+                A chat runs against a pipeline. Build one first, then come back here.
+              </p>
+            </div>
+            <Button
+              className="bg-violet-600 hover:bg-violet-700 text-white"
+              onClick={() => { onOpenChange(false); navigate("/agents"); }}
+            >
+              Create your first pipeline
+            </Button>
           </div>
+        ) : (
+          <div className="space-y-4">
+            <div className="space-y-1">
+              <Label>Pipeline *</Label>
+              <Select value={agentId} onValueChange={(v: string | null) => setAgentId(v ?? "")}>
+                <SelectTrigger><SelectValue placeholder="Select pipeline" /></SelectTrigger>
+                <SelectContent>
+                  {pipelines.map((a) => (
+                    <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
 
-          <div className="space-y-1">
-            <Label>Title (optional)</Label>
-            <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="My research task" />
+            <div className="space-y-1">
+              <Label>Theme (optional)</Label>
+              <Input
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="What's this chat about? e.g. Q3 marketing plan"
+              />
+              <p className="text-[11px] text-zinc-400">
+                Shown in the sidebar so you can find the chat later.
+              </p>
+            </div>
+
+            <Button
+              className="w-full bg-violet-600 hover:bg-violet-700 text-white"
+              onClick={handleCreate}
+              disabled={!agentId || submitting}
+            >
+              {submitting ? "Creating…" : "Create Chat"}
+            </Button>
           </div>
-
-          <Button className="w-full" onClick={handleCreate} disabled={!agentId || submitting}>
-            {submitting ? "Creating…" : "Create Chat"}
-          </Button>
-        </div>
+        )}
       </DialogContent>
     </Dialog>
   );

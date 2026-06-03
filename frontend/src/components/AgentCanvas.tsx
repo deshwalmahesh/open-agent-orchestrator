@@ -71,14 +71,26 @@ const DEFAULT_AGENT_FORM: CreateAgentForm = {
 };
 
 // ─── Layout: 3-tier waterfall (top=supervisor, mid=internal, bottom=external) ──
+// Visual hierarchy: main agent is the largest box, sub-agent mid, tool/mcp
+// smallest. Sizes match the widths used in node JSX below. Heights stay
+// uniform per row to keep dagre's tree clean.
+function nodeWidth(type?: string): number {
+  if (type === "main-agent") return 300;
+  if (type === "sub-agent") return 220;
+  return 132;  // tool, mcp
+}
+
+function nodeHeight(type?: string): number {
+  if (type === "main-agent") return 100;
+  if (type === "sub-agent") return 84;
+  return 64;
+}
+
 function layoutNodes(nodes: Node[], edges: Edge[]): Node[] {
   const g = new dagre.graphlib.Graph();
   g.setDefaultEdgeLabel(() => ({}));
-  g.setGraph({ rankdir: "TB", ranksep: 80, nodesep: 28 });
-  nodes.forEach((n) => {
-    const w = n.type === "tool" || n.type === "mcp" ? 160 : 204;
-    g.setNode(n.id, { width: w, height: 76 });
-  });
+  g.setGraph({ rankdir: "TB", ranksep: 90, nodesep: 28 });
+  nodes.forEach((n) => g.setNode(n.id, { width: nodeWidth(n.type), height: nodeHeight(n.type) }));
   const internal = edges.filter((e) => !e.id.includes("mcp::"));
   const external = edges.filter((e) => e.id.includes("mcp::"));
   [...internal, ...external].forEach((e) => g.setEdge(e.source, e.target));
@@ -86,8 +98,9 @@ function layoutNodes(nodes: Node[], edges: Edge[]): Node[] {
 
   const laidOut = nodes.map((n) => {
     const pos = g.node(n.id);
-    const w = n.type === "tool" || n.type === "mcp" ? 160 : 204;
-    return { ...n, position: { x: pos.x - w / 2, y: pos.y - 38 } };
+    const w = nodeWidth(n.type);
+    const h = nodeHeight(n.type);
+    return { ...n, position: { x: pos.x - w / 2, y: pos.y - h / 2 } };
   });
 
   const root = laidOut.find((n) => n.type === "main-agent");
@@ -125,30 +138,36 @@ interface CanvasCtx {
 const Ctx = createContext<CanvasCtx | null>(null);
 function useCtx(): CanvasCtx { return useContext(Ctx)!; }
 
-// ─── Main agent node (violet) ──────────────────────────────────────────────────
+// ─── Main agent node (largest, saturated violet, strong shadow) ────────────────
+// Hierarchy: this is the largest and most visually heavy node on the canvas.
+// Big serif-weighted title, 3px ring on selection, deep shadow at rest.
 function MainNode({ id, data, selected }: NodeProps) {
   const { onAdd, onProps } = useCtx();
   return (
     <div
       className={cn(
-        "group relative rounded-2xl border-2 shadow-sm transition-all duration-150 w-[220px] cursor-pointer",
+        "group relative rounded-2xl border bg-white cursor-pointer transition-all duration-200 w-[300px]",
         selected
-          ? "border-violet-400 bg-violet-50 shadow-lg shadow-violet-100"
-          : "border-violet-200 bg-violet-50/70 hover:border-violet-300 hover:shadow hover:bg-violet-50",
+          ? "border-violet-500 ring-4 ring-violet-100 shadow-xl shadow-violet-200/60 -translate-y-0.5"
+          : "border-violet-300 shadow-md shadow-violet-100/60 hover:shadow-lg hover:shadow-violet-200/60 hover:-translate-y-0.5",
       )}
       onDoubleClick={(e) => { e.stopPropagation(); onProps({ kind: "root-agent", agentId: id }); }}
       onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onProps({ kind: "root-agent", agentId: id }); }}
     >
-      <div className="absolute inset-y-0 left-0 w-1.5 rounded-l-2xl bg-violet-500" />
-      <div className="pl-4 pr-3 py-3">
-        <p className="text-[9px] font-extrabold uppercase tracking-widest text-violet-500 mb-1">Supervisor</p>
-        <p className="font-semibold text-sm text-violet-900 truncate">{data.label as string}</p>
-        {(data.role as string) && <p className="text-[11px] text-violet-400 truncate mt-0.5">{data.role as string}</p>}
-        {(data.model as string) && <p className="text-[10px] text-violet-300 truncate mt-1 font-mono">{data.model as string}</p>}
+      <div className="absolute inset-y-0 left-0 w-2 rounded-l-2xl bg-gradient-to-b from-violet-500 to-violet-700" />
+      <div className="pl-5 pr-4 py-4">
+        <div className="flex items-center gap-1.5 mb-1.5">
+          <span className="w-1 h-1 rounded-full bg-violet-500" />
+          <p className="text-[9px] font-bold uppercase tracking-[0.18em] text-violet-600">Supervisor</p>
+        </div>
+        <p className="font-semibold text-base text-zinc-900 truncate leading-tight">{data.label as string}</p>
+        {(data.model as string) && (
+          <p className="text-[10px] text-zinc-400 truncate mt-1.5 font-mono">{data.model as string}</p>
+        )}
       </div>
       <button
         onClick={(e) => { e.stopPropagation(); onAdd(id, true); }}
-        className="nodrag nopan absolute -bottom-4 left-1/2 -translate-x-1/2 size-8 rounded-full bg-violet-500 hover:bg-violet-600 text-white text-lg font-bold flex items-center justify-center shadow-lg transition-all opacity-0 group-hover:opacity-100 scale-90 group-hover:scale-100"
+        className="nodrag nopan absolute -bottom-4 left-1/2 -translate-x-1/2 size-9 rounded-full bg-violet-600 hover:bg-violet-700 text-white text-lg font-medium flex items-center justify-center shadow-lg shadow-violet-300/60 transition-all opacity-0 group-hover:opacity-100 scale-90 group-hover:scale-100"
         title="Connect tool, MCP, or agent"
       >+</button>
       <H type="source" pos={Position.Bottom} />
@@ -156,37 +175,41 @@ function MainNode({ id, data, selected }: NodeProps) {
   );
 }
 
-// ─── Sub-agent node (blue) ────────────────────────────────────────────────────
+// ─── Sub-agent node (medium, same family lighter — violet-400) ────────────────
+// Smaller than main, lighter weight. Same color family signals "same kind of
+// thing, lower rank" rather than introducing a new hue.
 function SubAgentNode({ id, data, selected }: NodeProps) {
   const { onAdd, onProps, onRemoveAgent } = useCtx();
   return (
     <div
       className={cn(
-        "group relative rounded-2xl border-2 shadow-sm transition-all duration-150 w-[204px] cursor-pointer",
+        "group relative rounded-xl border bg-white cursor-pointer transition-all duration-150 w-[220px]",
         selected
-          ? "border-blue-400 bg-blue-50 shadow-lg shadow-blue-100"
-          : "border-blue-200 bg-blue-50/70 hover:border-blue-300 hover:shadow hover:bg-blue-50",
+          ? "border-violet-400 ring-2 ring-violet-100 shadow-md shadow-violet-100/60"
+          : "border-violet-200 shadow-sm hover:border-violet-300 hover:shadow",
       )}
       onDoubleClick={(e) => { e.stopPropagation(); onProps({ kind: "sub-agent", agentId: id }); }}
       onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onProps({ kind: "sub-agent", agentId: id }); }}
     >
-      <div className="absolute inset-y-0 left-0 w-1.5 rounded-l-2xl bg-blue-500" />
+      <div className="absolute inset-y-0 left-0 w-1 rounded-l-xl bg-violet-300" />
       <div className="pl-4 pr-3 py-3">
-        <p className="text-[9px] font-extrabold uppercase tracking-widest text-blue-500 mb-1">Sub Agent</p>
-        <p className="font-semibold text-sm text-blue-900 truncate">{data.label as string}</p>
-        {(data.role as string) && <p className="text-[11px] text-blue-400 truncate mt-0.5">{data.role as string}</p>}
+        <p className="text-[9px] font-bold uppercase tracking-[0.18em] text-violet-400 mb-1">Sub agent</p>
+        <p className="font-medium text-sm text-zinc-800 truncate leading-tight">{data.label as string}</p>
+        {(data.role as string) && (
+          <p className="text-[10px] text-zinc-400 truncate mt-0.5">{data.role as string}</p>
+        )}
       </div>
       {selected && (
         <div className="absolute -bottom-8 left-0 right-0 flex justify-center z-10">
           <button
             onClick={(e) => { e.stopPropagation(); onRemoveAgent(id); }}
-            className="nodrag nopan bg-white border border-red-200 text-red-500 rounded-lg px-3 py-1 text-xs hover:bg-red-50 shadow-sm font-medium"
-          >✕ Disconnect</button>
+            className="nodrag nopan bg-white border border-red-200 text-red-500 rounded-md px-3 py-1 text-xs hover:bg-red-50 shadow-sm font-medium"
+          >Disconnect</button>
         </div>
       )}
       <button
         onClick={(e) => { e.stopPropagation(); onAdd(id, false); }}
-        className="nodrag nopan absolute -bottom-4 left-1/2 -translate-x-1/2 size-8 rounded-full bg-blue-500 hover:bg-blue-600 text-white text-lg font-bold flex items-center justify-center shadow-lg transition-all opacity-0 group-hover:opacity-100 scale-90 group-hover:scale-100"
+        className="nodrag nopan absolute -bottom-3.5 left-1/2 -translate-x-1/2 size-7 rounded-full bg-violet-400 hover:bg-violet-500 text-white text-base font-medium flex items-center justify-center shadow-md transition-all opacity-0 group-hover:opacity-100 scale-90 group-hover:scale-100"
         title="Add tool to this agent"
       >+</button>
       <H type="target" pos={Position.Top} />
@@ -195,7 +218,9 @@ function SubAgentNode({ id, data, selected }: NodeProps) {
   );
 }
 
-// ─── Tool node (emerald) ──────────────────────────────────────────────────────
+// ─── Tool node (smallest, neutral zinc with a thin emerald accent dot) ────────
+// Tools are utilities, not agents — they get the lightest visual weight.
+// Neutral background with one tiny accent dot keeps the canvas calm.
 function ToolNode({ data, selected }: NodeProps) {
   const { onProps, onRemoveTool } = useCtx();
   const toolName = data.toolName as string;
@@ -203,25 +228,27 @@ function ToolNode({ data, selected }: NodeProps) {
   return (
     <div
       className={cn(
-        "group relative rounded-2xl border-2 shadow-sm transition-all duration-150 w-[160px] cursor-pointer",
+        "group relative rounded-lg border bg-white cursor-pointer transition-all duration-150 w-[132px]",
         selected
-          ? "border-emerald-400 bg-emerald-50 shadow-lg shadow-emerald-100"
-          : "border-emerald-200 bg-emerald-50/70 hover:border-emerald-300 hover:shadow hover:bg-emerald-50",
+          ? "border-emerald-400 ring-2 ring-emerald-100 shadow"
+          : "border-zinc-200 hover:border-emerald-300 hover:shadow-sm",
       )}
       onDoubleClick={(e) => { e.stopPropagation(); onProps({ kind: "tool", toolName, ownerAgentId: data.ownerAgentId as string, description: data.description as string }); }}
       onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onProps({ kind: "tool", toolName, ownerAgentId: data.ownerAgentId as string, description: data.description as string }); }}
     >
-      <div className="absolute inset-y-0 left-0 w-1.5 rounded-l-2xl bg-emerald-500" />
-      <div className="pl-4 pr-3 py-3">
-        <p className="text-[9px] font-extrabold uppercase tracking-widest text-emerald-500 mb-1">Tool · Internal</p>
-        <p className="font-semibold text-sm text-emerald-900 truncate">{displayName}</p>
+      <div className="px-3 py-2.5">
+        <div className="flex items-center gap-1.5 mb-0.5">
+          <span className="w-1 h-1 rounded-full bg-emerald-500" />
+          <p className="text-[8px] font-bold uppercase tracking-[0.15em] text-zinc-400">Tool</p>
+        </div>
+        <p className="font-medium text-xs text-zinc-800 truncate leading-tight">{displayName}</p>
       </div>
       {selected && (
-        <div className="absolute -bottom-8 left-0 right-0 flex justify-center z-10">
+        <div className="absolute -bottom-7 left-0 right-0 flex justify-center z-10">
           <button
             onClick={(e) => { e.stopPropagation(); onRemoveTool(toolName, data.ownerAgentId as string); }}
-            className="nodrag nopan bg-white border border-red-200 text-red-500 rounded-lg px-3 py-1 text-xs hover:bg-red-50 shadow-sm font-medium"
-          >✕ Remove</button>
+            className="nodrag nopan bg-white border border-red-200 text-red-500 rounded-md px-2 py-0.5 text-[11px] hover:bg-red-50 shadow-sm font-medium"
+          >Remove</button>
         </div>
       )}
       <H type="target" pos={Position.Top} />
@@ -229,7 +256,7 @@ function ToolNode({ data, selected }: NodeProps) {
   );
 }
 
-// ─── MCP node (amber) ─────────────────────────────────────────────────────────
+// ─── MCP node (smallest, neutral with amber dashed-accent) ─────────────────────
 function MCPNode({ data, selected }: NodeProps) {
   const { onProps, onRemoveMCP } = useCtx();
   const serverId = data.serverId as string;
@@ -237,26 +264,28 @@ function MCPNode({ data, selected }: NodeProps) {
   return (
     <div
       className={cn(
-        "group relative rounded-2xl border-2 shadow-sm transition-all duration-150 w-[160px] cursor-pointer",
+        "group relative rounded-lg border bg-white cursor-pointer transition-all duration-150 w-[132px]",
         selected
-          ? "border-amber-400 bg-amber-50 shadow-lg shadow-amber-100"
-          : "border-amber-200 bg-amber-50/70 hover:border-amber-300 hover:shadow hover:bg-amber-50",
+          ? "border-amber-400 ring-2 ring-amber-100 shadow"
+          : "border-zinc-200 border-dashed hover:border-amber-300 hover:shadow-sm",
       )}
       onDoubleClick={(e) => { e.stopPropagation(); onProps({ kind: "mcp", serverId, serverName: data.label as string }); }}
       onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onProps({ kind: "mcp", serverId, serverName: data.label as string }); }}
     >
-      <div className="absolute inset-y-0 left-0 w-1.5 rounded-l-2xl bg-amber-500" />
-      <div className="pl-4 pr-3 py-3">
-        <p className="text-[9px] font-extrabold uppercase tracking-widest text-amber-500 mb-1">MCP · External</p>
-        <p className="font-semibold text-sm text-amber-900 truncate">{data.label as string}</p>
-        <p className="text-[11px] text-amber-400 mt-0.5">{tools.length} tool{tools.length !== 1 ? "s" : ""}</p>
+      <div className="px-3 py-2.5">
+        <div className="flex items-center gap-1.5 mb-0.5">
+          <span className="w-1 h-1 rounded-full bg-amber-500" />
+          <p className="text-[8px] font-bold uppercase tracking-[0.15em] text-zinc-400">MCP</p>
+        </div>
+        <p className="font-medium text-xs text-zinc-800 truncate leading-tight">{data.label as string}</p>
+        <p className="text-[9px] text-zinc-400 mt-0.5">{tools.length} tool{tools.length !== 1 ? "s" : ""}</p>
       </div>
       {selected && (
-        <div className="absolute -bottom-8 left-0 right-0 flex justify-center z-10">
+        <div className="absolute -bottom-7 left-0 right-0 flex justify-center z-10">
           <button
             onClick={(e) => { e.stopPropagation(); onRemoveMCP(serverId); }}
-            className="nodrag nopan bg-white border border-red-200 text-red-500 rounded-lg px-3 py-1 text-xs hover:bg-red-50 shadow-sm font-medium"
-          >✕ Disconnect</button>
+            className="nodrag nopan bg-white border border-red-200 text-red-500 rounded-md px-2 py-0.5 text-[11px] hover:bg-red-50 shadow-sm font-medium"
+          >Disconnect</button>
         </div>
       )}
       <H type="target" pos={Position.Top} />
@@ -618,19 +647,24 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
 
   // ── Create new agent inline handler ───────────────────────────────────────
   async function handleSubmitNewAgent() {
-    if (!agentForm.name.trim() || !agentForm.base_url.trim() || !agentForm.model.trim() || !agentForm.personaId) return;
+    if (!agentForm.name.trim() || !agentForm.model.trim() || !agentForm.personaId) return;
     setCreatingAgent(true);
     try {
       const picked = personas.find((x) => x.id === agentForm.personaId);
       const systemPrompt = picked?.system_prompt ?? "You are a helpful assistant.";
+      // Inline form here is a fast-path for sub-agent creation — it inherits the
+      // parent pipeline's provider rather than asking the user to pick again.
+      // Full provider switching happens on the agent edit form.
+      const parentLLM = agent.config.llm;
       const config: AgentConfig = {
         name: agentForm.name,
         role: "assistant",
         description: null,
         system_prompt: systemPrompt,
         llm: {
-          base_url: agentForm.base_url,
-          api_key: agentForm.api_key || "EMPTY",
+          provider: parentLLM.provider ?? "openai",
+          base_url: agentForm.base_url || parentLLM.base_url || "",
+          api_key: agentForm.api_key || parentLLM.api_key || "",
           model: agentForm.model,
           temperature: 0.7,
           max_tokens: 1024,
@@ -645,7 +679,12 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
         channels: [],
         metadata: {},
       };
-      saveLLMDefaults({ base_url: agentForm.base_url, api_key: agentForm.api_key, model: agentForm.model });
+      saveLLMDefaults({
+        provider: parentLLM.provider ?? "openai",
+        base_url: agentForm.base_url,
+        api_key: agentForm.api_key,
+        model: agentForm.model,
+      });
       const newAgent = await apiCreateAgent(token!, config);
       await qc.invalidateQueries({ queryKey: ["agents"] });
       await addSubagent(newAgent.id);
@@ -689,7 +728,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
           edges={edges}
           nodeTypes={nodeTypes}
           fitView
-          fitViewOptions={{ padding: 0.35 }}
+          fitViewOptions={{ padding: 0.6, maxZoom: 0.95 }}
           proOptions={{ hideAttribution: true }}
           nodesConnectable={false}
           edgesFocusable={false}
@@ -709,18 +748,14 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
           </div>
         )}
 
-        {/* Legend */}
-        <div className="absolute top-3 right-3 bg-white/90 border border-gray-200 rounded-xl p-3 text-xs shadow-sm backdrop-blur-sm space-y-1.5">
-          <p className="font-bold text-[10px] uppercase tracking-wider text-gray-400 mb-2">Legend</p>
-          <div className="flex items-center gap-2"><span className="w-2.5 h-2.5 rounded bg-violet-500" />Supervisor</div>
-          <div className="flex items-center gap-2"><span className="w-2.5 h-2.5 rounded bg-blue-500" />Sub Agent</div>
-          <div className="flex items-center gap-2"><span className="w-2.5 h-2.5 rounded bg-emerald-500" />Tool <span className="text-gray-400">(internal)</span></div>
-          <div className="flex items-center gap-2"><span className="w-2.5 h-2.5 rounded bg-amber-500" />MCP <span className="text-gray-400">(external)</span></div>
-          <div className="mt-1.5 pt-1.5 border-t space-y-1">
-            <div className="flex items-center gap-2"><span className="w-6 border-t-2 border-emerald-400 inline-block" />Internal</div>
-            <div className="flex items-center gap-2"><span className="w-6 border-t-2 border-dashed border-amber-400 inline-block" />External</div>
-          </div>
-          <p className="text-gray-400 text-[10px] mt-1">Hover → + connect · Dbl-click → edit</p>
+        {/* Legend — calm, neutral background, color dots only */}
+        <div className="absolute top-3 right-3 bg-white/95 border border-zinc-200 rounded-lg px-3 py-2.5 text-[11px] shadow-sm backdrop-blur-sm space-y-1.5">
+          <p className="font-bold text-[9px] uppercase tracking-[0.18em] text-zinc-400 mb-1.5">Legend</p>
+          <div className="flex items-center gap-2 text-zinc-700"><span className="w-1.5 h-1.5 rounded-full bg-violet-600" />Supervisor</div>
+          <div className="flex items-center gap-2 text-zinc-700"><span className="w-1.5 h-1.5 rounded-full bg-violet-300" />Sub agent</div>
+          <div className="flex items-center gap-2 text-zinc-700"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />Tool</div>
+          <div className="flex items-center gap-2 text-zinc-700"><span className="w-1.5 h-1.5 rounded-full bg-amber-500" />MCP</div>
+          <p className="text-zinc-400 text-[10px] pt-1 border-t border-zinc-100">Hover → + · Dbl-click → edit</p>
         </div>
 
         {/* ── Left panel (add connections) ────────────────────────────────── */}

@@ -24,11 +24,20 @@ class _Base(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
 
-class LLMConfig(_Base):
-    """OpenAI-compatible — vLLM, OpenAI, Gemini-via-proxy all fit."""
+Provider = Literal["openai", "anthropic", "google", "vllm"]
 
-    base_url: str
-    api_key: str = "EMPTY"
+
+class LLMConfig(_Base):
+    """LLM client config. `provider` picks the underlying langchain client.
+
+    - openai / vllm: ChatOpenAI (vllm = openai-compatible endpoint, custom base_url).
+    - anthropic: ChatAnthropic — ignores base_url.
+    - google: ChatGoogleGenerativeAI — ignores base_url; api_key is the Gemini key.
+    """
+
+    provider: Provider = "openai"
+    base_url: str = ""  # required for openai-custom and vllm; ignored for anthropic/google
+    api_key: str = ""
     model: str
     # Default tuned for reasoning models (Qwen3.5, DeepSeek-R1, etc.) which need
     # ≥0.6 to avoid degenerate output. Override per-agent for non-reasoning models.

@@ -14,15 +14,63 @@ import { listPersonas } from "@/api/personas";
 import { useAuth } from "@/hooks/useAuth";
 import { cn, isPipelineRoot } from "@/lib/utils";
 import { getLLMDefaults, saveLLMDefaults } from "@/lib/llm-defaults";
-import type { Agent, AgentConfig, Persona } from "@/types";
+import type { Agent, AgentConfig, LLMProvider, Persona } from "@/types";
 
-// ─── Provider quick-select ────────────────────────────────────────────────────
-const PROVIDER_PRESETS = [
-  { label: "OpenAI",   url: "https://api.openai.com/v1",  model: "gpt-4o-mini" },
-  { label: "vLLM",     url: "http://localhost:8000/v1",   model: "" },
-  { label: "Anthropic",url: "https://api.anthropic.com/v1", model: "claude-3-haiku-20240307" },
-  { label: "Custom",   url: "",                            model: "" },
-] as const;
+// ─── Provider catalogue ──────────────────────────────────────────────────────
+// Each provider sets which fields are visible and what placeholder hints to
+// show. Behind the scenes the backend dispatches to ChatOpenAI /
+// ChatAnthropic / ChatGoogleGenerativeAI based on `provider`. vLLM piggy-backs
+// on ChatOpenAI with a custom base_url.
+type ProviderMeta = {
+  id: LLMProvider;
+  label: string;
+  showBaseUrl: boolean;
+  baseUrlPlaceholder?: string;
+  modelPlaceholder: string;
+  apiKeyLabel: string;
+  apiKeyPlaceholder: string;
+};
+
+const PROVIDERS: ProviderMeta[] = [
+  {
+    id: "openai",
+    label: "OpenAI",
+    showBaseUrl: true,
+    baseUrlPlaceholder: "https://api.openai.com/v1",
+    modelPlaceholder: "e.g. gpt-4o-mini",
+    apiKeyLabel: "OpenAI API key",
+    apiKeyPlaceholder: "sk-…",
+  },
+  {
+    id: "anthropic",
+    label: "Anthropic",
+    showBaseUrl: false,
+    modelPlaceholder: "e.g. claude-sonnet-4-5",
+    apiKeyLabel: "Anthropic API key",
+    apiKeyPlaceholder: "sk-ant-…",
+  },
+  {
+    id: "google",
+    label: "Google (Gemini)",
+    showBaseUrl: false,
+    modelPlaceholder: "e.g. gemini-2.0-flash",
+    apiKeyLabel: "Gemini API key",
+    apiKeyPlaceholder: "AIza…",
+  },
+  {
+    id: "vllm",
+    label: "vLLM (OpenAI-compatible)",
+    showBaseUrl: true,
+    baseUrlPlaceholder: "http://localhost:8000/v1",
+    modelPlaceholder: "served model name",
+    apiKeyLabel: "API key (optional)",
+    apiKeyPlaceholder: "leave blank if not required",
+  },
+];
+
+const PROVIDER_BY_ID: Record<LLMProvider, ProviderMeta> = Object.fromEntries(
+  PROVIDERS.map((p) => [p.id, p]),
+) as Record<LLMProvider, ProviderMeta>;
 
 // ─── Zod schema ───────────────────────────────────────────────────────────────
 // system_prompt is no longer a form field — it's derived from the picked persona
@@ -32,7 +80,8 @@ const PROVIDER_PRESETS = [
 const schema = z.object({
   name: z.string(),
   role: z.string(),
-  llm_base_url: z.string().min(1, "Required"),
+  llm_provider: z.enum(["openai", "anthropic", "google", "vllm"]),
+  llm_base_url: z.string(),
   llm_api_key: z.string(),
   llm_model: z.string().min(1, "Required"),
   llm_temperature: z.number().min(0).max(2),
@@ -52,6 +101,7 @@ function configToForm(config: AgentConfig): FormValues {
   return {
     name: config.name,
     role: config.role,
+    llm_provider: config.llm.provider ?? "openai",
     llm_base_url: config.llm.base_url,
     llm_api_key: config.llm.api_key,
     llm_model: config.llm.model,
@@ -72,15 +122,19 @@ function formToConfig(
   systemPrompt: string,
   existing?: AgentConfig,
 ): AgentConfig {
+  const providerMeta = PROVIDER_BY_ID[values.llm_provider];
   return {
     name: values.name.trim() || existing?.name || "Pipeline",
     role: values.role.trim() || existing?.role || "supervisor",
     description: existing?.description ?? null,
     system_prompt: systemPrompt,
     llm: {
-      base_url: values.llm_base_url,
-      api_key: values.llm_api_key || "EMPTY",
-      model: values.llm_model,
+      provider: values.llm_provider,
+      // Providers that don't take a base_url (anthropic, google) save it empty
+      // regardless of what the user might have typed — keeps configs clean.
+      base_url: providerMeta.showBaseUrl ? values.llm_base_url.trim() : "",
+      api_key: values.llm_api_key,
+      model: values.llm_model.trim(),
       temperature: values.llm_temperature,
       max_tokens: values.llm_max_tokens,
       timeout_s: existing?.llm.timeout_s ?? 30.0,
@@ -107,6 +161,7 @@ function getDefaultValues(): FormValues {
   return {
     name: "",
     role: "supervisor",
+    llm_provider: llm.provider,
     llm_base_url: llm.base_url,
     llm_api_key: llm.api_key,
     llm_model: llm.model,
@@ -177,7 +232,8 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
   const temperature = watch("llm_temperature");
   const selectedSkills = watch("skills");
   const selectedSubagents = watch("subagents");
-  const currentBaseUrl = watch("llm_base_url");
+  const currentProvider = watch("llm_provider");
+  const providerMeta = PROVIDER_BY_ID[currentProvider];
 
   const isPaid = (user?.plan ?? "free") !== "free";
   const subagentOptions = allAgents.filter((a) => a.id !== agent?.id);
@@ -189,22 +245,15 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
 
   const selectedPersona = personas.find((p) => p.id === personaId);
 
-  function toggleItem(field: "tools" | "skills" | "subagents", id: string, checked: boolean) {
-    const current = { tools: selectedTools, skills: selectedSkills, subagents: selectedSubagents }[field];
+  function toggleItem(field: "skills" | "subagents", id: string, checked: boolean) {
+    const current = field === "skills" ? selectedSkills : selectedSubagents;
     setValue(field, checked ? [...current, id] : current.filter((x) => x !== id));
   }
-
-  function applyProvider(preset: typeof PROVIDER_PRESETS[number]) {
-    setValue("llm_base_url", preset.url);
-    if (preset.model) setValue("llm_model", preset.model);
-  }
-
-  // Detect which provider matches the current base URL
-  const activeProvider = PROVIDER_PRESETS.find((p) => p.url && currentBaseUrl === p.url)?.label ?? "Custom";
 
   async function onValid(values: FormValues) {
     // Persist LLM settings so new agents / sub-agents pre-fill from them
     saveLLMDefaults({
+      provider: values.llm_provider,
       base_url: values.llm_base_url,
       api_key: values.llm_api_key,
       model: values.llm_model,
@@ -305,43 +354,35 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
           </CollapsibleTrigger>
           <CollapsibleContent className="space-y-4">
 
-            {/* Provider preset buttons */}
-            <div>
-              <Label className="text-xs font-semibold text-gray-600 block mb-2">Provider</Label>
-              <div className="flex gap-2 flex-wrap">
-                {PROVIDER_PRESETS.map((p) => (
-                  <button
-                    key={p.label}
-                    type="button"
-                    onClick={() => applyProvider(p)}
-                    className={cn(
-                      "px-3 py-1.5 rounded-lg border text-xs font-semibold transition-all",
-                      activeProvider === p.label
-                        ? "border-violet-400 bg-violet-50 text-violet-700"
-                        : "border-gray-200 text-gray-500 hover:border-violet-200 hover:bg-violet-50/50",
-                    )}
-                  >
-                    {p.label}
-                  </button>
+            {/* Provider dropdown — drives which downstream fields are visible. */}
+            <div className="space-y-1.5">
+              <Label className="text-xs font-semibold text-gray-600">Provider</Label>
+              <select
+                {...register("llm_provider")}
+                className="w-full h-9 border border-input rounded-md px-2 text-sm bg-background focus-visible:ring-2 focus-visible:ring-violet-300"
+              >
+                {PROVIDERS.map((p) => (
+                  <option key={p.id} value={p.id}>{p.label}</option>
                 ))}
-              </div>
+              </select>
             </div>
 
-            <div className="space-y-1.5">
-              <Label className="text-xs font-semibold text-gray-600">Base URL *</Label>
-              <Input
-                {...register("llm_base_url")}
-                placeholder="https://api.openai.com/v1"
-                className="font-mono text-xs focus-visible:ring-violet-300"
-              />
-              {errors.llm_base_url && <p className="text-xs text-destructive">{errors.llm_base_url.message}</p>}
-            </div>
+            {providerMeta.showBaseUrl && (
+              <div className="space-y-1.5">
+                <Label className="text-xs font-semibold text-gray-600">Base URL</Label>
+                <Input
+                  {...register("llm_base_url")}
+                  placeholder={providerMeta.baseUrlPlaceholder}
+                  className="font-mono text-xs focus-visible:ring-violet-300"
+                />
+              </div>
+            )}
 
             <div className="space-y-1.5">
               <Label className="text-xs font-semibold text-gray-600">Model *</Label>
               <Input
                 {...register("llm_model")}
-                placeholder="gpt-4o-mini"
+                placeholder={providerMeta.modelPlaceholder}
                 className="focus-visible:ring-violet-300"
               />
               {errors.llm_model && <p className="text-xs text-destructive">{errors.llm_model.message}</p>}
@@ -349,23 +390,19 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
 
             {/* API key: hidden for paid plans, required for free */}
             {isPaid ? (
-              <div className="px-4 py-3 bg-gradient-to-r from-violet-50 to-purple-50 border border-violet-200 rounded-xl">
+              <div className="px-4 py-3 bg-violet-50 border border-violet-200 rounded-lg">
                 <p className="text-xs font-bold text-violet-700">API key — managed by your plan</p>
                 <p className="text-xs text-violet-500 mt-0.5">Your {user?.plan} plan provides LLM access automatically.</p>
               </div>
             ) : (
               <div className="space-y-1.5">
-                <Label className="text-xs font-semibold text-gray-600">
-                  API Key
-                  <span className="ml-1.5 text-amber-500 font-normal">(required — free plan)</span>
-                </Label>
+                <Label className="text-xs font-semibold text-gray-600">{providerMeta.apiKeyLabel}</Label>
                 <Input
                   {...register("llm_api_key")}
                   type="password"
-                  placeholder="sk-… (leave EMPTY only if using key-free local model)"
+                  placeholder={providerMeta.apiKeyPlaceholder}
                   className="focus-visible:ring-violet-300"
                 />
-                <p className="text-[10px] text-muted-foreground">Missing key will cause agent runs to fail. Enter your provider API key.</p>
               </div>
             )}
 

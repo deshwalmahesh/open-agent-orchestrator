@@ -7,13 +7,13 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import structlog
 
 from app.db import get_async_session
-from app.db.models import AgentDB, UserDB
+from app.db.models import AgentDB, MessageDB, UserDB
 from app.db.repos import (
     create_chat,
     delete_chat,
@@ -53,7 +53,7 @@ class ChatPatchBody(BaseModel):
     agent_id: UUID | None = None
 
 
-def _to_response(row, agent_name: str | None = None) -> dict:
+def _to_response(row, agent_name: str | None = None, preview: str | None = None) -> dict:
     return {
         "id": str(row.id),
         "agent_id": str(row.agent_id) if row.agent_id else None,
@@ -61,6 +61,7 @@ def _to_response(row, agent_name: str | None = None) -> dict:
         "channel": row.channel,
         "external_thread_id": row.external_thread_id,
         "title": row.title,
+        "preview": preview,
         "created_at": row.created_at.isoformat(),
         "updated_at": row.updated_at.isoformat(),
     }
@@ -87,6 +88,9 @@ async def create(
     return _to_response(row)
 
 
+_PREVIEW_LEN = 80
+
+
 @router.get("")
 async def list_mine(
     user: Annotated[UserDB, Depends(current_active_user)],
@@ -100,7 +104,33 @@ async def list_mine(
             select(AgentDB.id, AgentDB.name).where(AgentDB.id.in_(agent_ids))
         )).all()
         names = {row.id: row.name for row in rows}
-    return [_to_response(c, agent_name=names.get(c.agent_id)) for c in chats]
+
+    # Preview = first user message per chat (single query, no N+1).
+    previews: dict[UUID, str] = {}
+    chat_ids = [c.id for c in chats]
+    if chat_ids:
+        earliest = (
+            select(MessageDB.chat_id, func.min(MessageDB.ts).label("ts"))
+            .where(MessageDB.chat_id.in_(chat_ids), MessageDB.sender == "user")
+            .group_by(MessageDB.chat_id)
+            .subquery()
+        )
+        msg_rows = (await session.execute(
+            select(MessageDB.chat_id, MessageDB.content).join(
+                earliest,
+                (MessageDB.chat_id == earliest.c.chat_id) & (MessageDB.ts == earliest.c.ts),
+            )
+        )).all()
+        for r in msg_rows:
+            content = (r.content or "").replace("\n", " ").strip()
+            previews[r.chat_id] = (
+                content[:_PREVIEW_LEN] + "…" if len(content) > _PREVIEW_LEN else content
+            )
+
+    return [
+        _to_response(c, agent_name=names.get(c.agent_id), preview=previews.get(c.id))
+        for c in chats
+    ]
 
 
 @router.get("/{chat_id}")

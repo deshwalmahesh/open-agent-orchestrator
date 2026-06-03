@@ -4,13 +4,17 @@ Visual multi-agent pipelines (you know them as "Multi Agent workflows"). Build a
 
 ![Canvas](assets/canvas.png)
 
-![Demo](assets/demo.gif)
+# Usage
 
 ```bash
 cp .env.example .env && docker compose up
 ```
 
 → `http://localhost` (UI) · `http://localhost:8000/docs` (API)
+
+# Demo
+
+![Demo](assets/demo.gif)
 
 ---
 

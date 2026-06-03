@@ -39,7 +39,11 @@ def test_unknown_slack_user_gets_help(client):
     say.assert_awaited_once()
     kwargs = say.await_args.kwargs
     assert kwargs["thread_ts"] == "1.1"
-    assert "register" in kwargs["text"].lower()
+    # Friendly hint: tells user we don't recognise them and echoes their Slack ID
+    # so they can self-link via the web UI.
+    text = kwargs["text"].lower()
+    assert "recognise" in text
+    assert "u_unknown" in text
 
 
 def test_known_user_no_agent_gets_hint(client, signup_and_login):
@@ -50,7 +54,7 @@ def test_known_user_no_agent_gets_hint(client, signup_and_login):
     say = AsyncMock()
     asyncio.run(handle_slack_message(_event(), say, session_factory=get_session_factory()))
     say.assert_awaited_once()
-    assert "agents" in say.await_args.kwargs["text"].lower()
+    assert "pipeline" in say.await_args.kwargs["text"].lower()
 
 
 def test_known_user_with_agent_dispatches_run(client, signup_and_login, auth_header, sample_agent_config, monkeypatch):

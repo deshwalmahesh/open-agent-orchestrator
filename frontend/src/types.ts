@@ -2,7 +2,7 @@ export interface User {
   id: string;
   email: string;
   name?: string;
-  slack_user_id?: string;
+  slack_user_id?: string | null;
   is_active: boolean;
   plan: "free" | "paid" | "admin";
 }

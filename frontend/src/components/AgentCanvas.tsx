@@ -123,16 +123,17 @@ function H({ type, pos }: { type: "source" | "target"; pos: Position }) {
 
 // ─── Canvas context ───────────────────────────────────────────────────────────
 type PropsTarget =
-  | { kind: "root-agent" | "sub-agent"; agentId: string }
+  | { kind: "root-agent"; agentId: string }
+  | { kind: "sub-agent"; agentId: string; parentAgentId: string }
   | { kind: "tool"; toolName: string; ownerAgentId: string; description: string }
-  | { kind: "mcp"; serverId: string; serverName: string };
+  | { kind: "mcp"; serverId: string; serverName: string; ownerAgentId: string };
 
 interface CanvasCtx {
   onAdd: (sourceAgentId: string, isRoot: boolean) => void;
   onProps: (t: PropsTarget) => void;
   onRemoveTool: (toolName: string, ownerAgentId: string) => void;
-  onRemoveAgent: (subAgentId: string) => void;
-  onRemoveMCP: (serverId: string) => void;
+  onRemoveAgent: (subAgentId: string, parentAgentId: string) => void;
+  onRemoveMCP: (serverId: string, parentAgentId: string) => void;
 }
 
 const Ctx = createContext<CanvasCtx | null>(null);
@@ -188,8 +189,8 @@ function SubAgentNode({ id, data, selected }: NodeProps) {
           ? "border-violet-400 ring-2 ring-violet-100 shadow-md shadow-violet-100/60"
           : "border-violet-200 shadow-sm hover:border-violet-300 hover:shadow",
       )}
-      onDoubleClick={(e) => { e.stopPropagation(); onProps({ kind: "sub-agent", agentId: id }); }}
-      onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onProps({ kind: "sub-agent", agentId: id }); }}
+      onDoubleClick={(e) => { e.stopPropagation(); onProps({ kind: "sub-agent", agentId: id, parentAgentId: data.parentAgentId as string }); }}
+      onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onProps({ kind: "sub-agent", agentId: id, parentAgentId: data.parentAgentId as string }); }}
     >
       <div className="absolute inset-y-0 left-0 w-1 rounded-l-xl bg-violet-300" />
       <div className="pl-4 pr-3 py-3">
@@ -202,7 +203,7 @@ function SubAgentNode({ id, data, selected }: NodeProps) {
       {selected && (
         <div className="absolute -bottom-8 left-0 right-0 flex justify-center z-10">
           <button
-            onClick={(e) => { e.stopPropagation(); onRemoveAgent(id); }}
+            onClick={(e) => { e.stopPropagation(); onRemoveAgent(id, data.parentAgentId as string); }}
             className="nodrag nopan bg-white border border-red-200 text-red-500 rounded-md px-3 py-1 text-xs hover:bg-red-50 shadow-sm font-medium"
           >Disconnect</button>
         </div>
@@ -269,8 +270,8 @@ function MCPNode({ data, selected }: NodeProps) {
           ? "border-amber-400 ring-2 ring-amber-100 shadow"
           : "border-zinc-200 border-dashed hover:border-amber-300 hover:shadow-sm",
       )}
-      onDoubleClick={(e) => { e.stopPropagation(); onProps({ kind: "mcp", serverId, serverName: data.label as string }); }}
-      onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onProps({ kind: "mcp", serverId, serverName: data.label as string }); }}
+      onDoubleClick={(e) => { e.stopPropagation(); onProps({ kind: "mcp", serverId, serverName: data.label as string, ownerAgentId: data.ownerAgentId as string }); }}
+      onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onProps({ kind: "mcp", serverId, serverName: data.label as string, ownerAgentId: data.ownerAgentId as string }); }}
     >
       <div className="px-3 py-2.5">
         <div className="flex items-center gap-1.5 mb-0.5">
@@ -283,7 +284,7 @@ function MCPNode({ data, selected }: NodeProps) {
       {selected && (
         <div className="absolute -bottom-7 left-0 right-0 flex justify-center z-10">
           <button
-            onClick={(e) => { e.stopPropagation(); onRemoveMCP(serverId); }}
+            onClick={(e) => { e.stopPropagation(); onRemoveMCP(serverId, data.ownerAgentId as string); }}
             className="nodrag nopan bg-white border border-red-200 text-red-500 rounded-md px-2 py-0.5 text-[11px] hover:bg-red-50 shadow-sm font-medium"
           >Disconnect</button>
         </div>
@@ -426,38 +427,48 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
     }
   }, [agent, allAgents, token, qc]);
 
-  const addSubagent = useCallback(async (subId: string) => {
-    if (agent.config.subagents.includes(subId)) return;
-    const updated: AgentConfig = { ...agent.config, subagents: [...agent.config.subagents, subId] };
-    patchAgent(qc, agent.id, updated);
+  // Resolve config for any agent in the current tree (root or sub).
+  const _configOf = useCallback((parentId: string): AgentConfig => {
+    return parentId === agent.id
+      ? agent.config
+      : allAgents.find((a) => a.id === parentId)?.config ?? agent.config;
+  }, [agent, allAgents]);
+
+  const addSubagent = useCallback(async (subId: string, parentId: string = agent.id) => {
+    const cfg = _configOf(parentId);
+    if (cfg.subagents.includes(subId)) return;
+    const updated: AgentConfig = { ...cfg, subagents: [...cfg.subagents, subId] };
+    patchAgent(qc, parentId, updated);
     setAddPanel(null);
     try {
-      await updateAgent(token!, agent.id, updated);
+      await updateAgent(token!, parentId, updated);
     } catch (e) {
       console.error("Failed to add sub-agent:", e);
       await qc.invalidateQueries({ queryKey: ["agents"] });
     }
-  }, [agent, token, qc]);
+  }, [agent, token, qc, _configOf]);
 
-  const removeSubagent = useCallback(async (subId: string) => {
-    const updated: AgentConfig = { ...agent.config, subagents: agent.config.subagents.filter((id) => id !== subId) };
-    patchAgent(qc, agent.id, updated);
+  const removeSubagent = useCallback(async (subId: string, parentId: string = agent.id) => {
+    const cfg = _configOf(parentId);
+    const updated: AgentConfig = { ...cfg, subagents: cfg.subagents.filter((id) => id !== subId) };
+    patchAgent(qc, parentId, updated);
     setPropsTarget(null);
     try {
-      await updateAgent(token!, agent.id, updated);
+      await updateAgent(token!, parentId, updated);
     } catch (e) {
       console.error("Failed to remove sub-agent:", e);
       await qc.invalidateQueries({ queryKey: ["agents"] });
     }
-  }, [agent, token, qc]);
+  }, [agent, token, qc, _configOf]);
 
   // Delete the sub-agent ENTIRELY from the account (not just detach). Detaches
-  // from this pipeline first if attached, then deletes the AgentDB row. Other
-  // pipelines that referenced it will get a stale reference until they edit.
-  const deleteSubagentRegistration = useCallback(async (subId: string, subName: string) => {
+  // from the current parent first if attached, then deletes the AgentDB row.
+  // Other pipelines/parents that referenced it get a stale reference until they edit.
+  const deleteSubagentRegistration = useCallback(async (subId: string, subName: string, parentId: string = agent.id) => {
     if (!confirm(`Delete sub-agent "${subName}" from your account?\nOther pipelines using it will lose the reference.`)) return;
-    if (agent.config.subagents.includes(subId)) {
-      await removeSubagent(subId);
+    const cfg = _configOf(parentId);
+    if (cfg.subagents.includes(subId)) {
+      await removeSubagent(subId, parentId);
     }
     try {
       await apiDeleteAgent(token!, subId);
@@ -465,38 +476,39 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
     } catch (e) {
       console.error("Failed to delete sub-agent:", e);
     }
-  }, [agent, token, qc, removeSubagent]);
+  }, [agent, token, qc, removeSubagent, _configOf]);
 
-  const addMCPServer = useCallback(async (serverId: string) => {
-    if (agent.config.mcp_servers.includes(serverId)) return;
-    const updated: AgentConfig = { ...agent.config, mcp_servers: [...agent.config.mcp_servers, serverId] };
-    patchAgent(qc, agent.id, updated);
+  const addMCPServer = useCallback(async (serverId: string, parentId: string = agent.id) => {
+    const cfg = _configOf(parentId);
+    if (cfg.mcp_servers.includes(serverId)) return;
+    const updated: AgentConfig = { ...cfg, mcp_servers: [...cfg.mcp_servers, serverId] };
+    patchAgent(qc, parentId, updated);
     try {
-      await updateAgent(token!, agent.id, updated);
+      await updateAgent(token!, parentId, updated);
     } catch (e) {
       console.error("Failed to add MCP server:", e);
       await qc.invalidateQueries({ queryKey: ["agents"] });
     }
-  }, [agent, token, qc]);
+  }, [agent, token, qc, _configOf]);
 
-  const removeMCPServer = useCallback(async (serverId: string) => {
-    const updated: AgentConfig = { ...agent.config, mcp_servers: agent.config.mcp_servers.filter((id) => id !== serverId) };
-    patchAgent(qc, agent.id, updated);
+  const removeMCPServer = useCallback(async (serverId: string, parentId: string = agent.id) => {
+    const cfg = _configOf(parentId);
+    const updated: AgentConfig = { ...cfg, mcp_servers: cfg.mcp_servers.filter((id) => id !== serverId) };
+    patchAgent(qc, parentId, updated);
     setPropsTarget(null);
     try {
-      await updateAgent(token!, agent.id, updated);
+      await updateAgent(token!, parentId, updated);
     } catch (e) {
       console.error("Failed to remove MCP server:", e);
       await qc.invalidateQueries({ queryKey: ["agents"] });
     }
-  }, [agent, token, qc]);
+  }, [agent, token, qc, _configOf]);
 
-  // Delete the MCP server REGISTRATION (not just detach). Detaches from this
-  // pipeline first if attached, then deletes the user's MCP-server row.
-  const deleteMCPRegistration = useCallback(async (serverId: string, serverName: string) => {
+  const deleteMCPRegistration = useCallback(async (serverId: string, serverName: string, parentId: string = agent.id) => {
     if (!confirm(`Delete MCP server "${serverName}"? This unregisters it from your account.`)) return;
-    if (agent.config.mcp_servers.includes(serverId)) {
-      await removeMCPServer(serverId);
+    const cfg = _configOf(parentId);
+    if (cfg.mcp_servers.includes(serverId)) {
+      await removeMCPServer(serverId, parentId);
     }
     try {
       await deleteMCPServer(token!, serverId);
@@ -504,7 +516,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
     } catch (e) {
       console.error("Failed to delete MCP server:", e);
     }
-  }, [agent, token, qc, removeMCPServer]);
+  }, [agent, token, qc, removeMCPServer, _configOf]);
 
   // ── Context ───────────────────────────────────────────────────────────────
   const onAdd = useCallback((sourceAgentId: string, isRoot: boolean) => {
@@ -527,8 +539,8 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
   }, [agent.config.llm]);
   const onProps = useCallback((t: PropsTarget) => setPropsTarget(t), []);
   const onRemoveTool = useCallback((n: string, owner: string) => removeTool(n, owner), [removeTool]);
-  const onRemoveAgent = useCallback((id: string) => removeSubagent(id), [removeSubagent]);
-  const onRemoveMCP = useCallback((id: string) => removeMCPServer(id), [removeMCPServer]);
+  const onRemoveAgent = useCallback((id: string, parentId: string) => removeSubagent(id, parentId), [removeSubagent]);
+  const onRemoveMCP = useCallback((id: string, parentId: string) => removeMCPServer(id, parentId), [removeMCPServer]);
   const ctx = useMemo<CanvasCtx>(
     () => ({ onAdd, onProps, onRemoveTool, onRemoveAgent, onRemoveMCP }),
     [onAdd, onProps, onRemoveTool, onRemoveAgent, onRemoveMCP],
@@ -559,40 +571,36 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
       position: { x: 0, y: 0 },
     });
 
-    agent.config.tools.forEach((toolName) => {
-      const nid = `${agent.id}::${toolName}`;
-      ns.push({ id: nid, type: "tool", data: { label: toolName, toolName, displayName: toolDisplayMap[toolName] ?? toolName, ownerAgentId: agent.id, description: toolDescMap[toolName] ?? "" }, position: { x: 0, y: 0 } });
-      es.push({ id: `e:${agent.id}->${nid}`, source: agent.id, target: nid, style: { stroke: "#10b981", strokeWidth: 2 } });
-    });
-
-    agent.config.subagents.forEach((subId) => {
-      const sub = allAgents.find((a) => a.id === subId);
-      if (!sub) return;
-      ns.push({ id: sub.id, type: "sub-agent", data: { label: sub.name, role: sub.config.role }, position: { x: 0, y: 0 } });
-      es.push({ id: `e:${agent.id}->${sub.id}`, source: agent.id, target: sub.id, style: { stroke: "#3b82f6", strokeWidth: 2 } });
-      sub.config.tools.forEach((toolName) => {
-        const nid = `${sub.id}::${toolName}`;
-        ns.push({ id: nid, type: "tool", data: { label: toolName, toolName, displayName: toolDisplayMap[toolName] ?? toolName, ownerAgentId: sub.id, description: toolDescMap[toolName] ?? "" }, position: { x: 0, y: 0 } });
-        es.push({ id: `e:${sub.id}->${nid}`, source: sub.id, target: nid, style: { stroke: "#10b981", strokeWidth: 2 } });
+    // Recursive walk: render each agent's tools + MCP + sub-agents. visited
+    // skips an agent if it already appears in the tree, preventing duplicate
+    // React Flow node IDs when the same sub-agent is attached under multiple
+    // parents (first occurrence wins in the visualization; backend still has
+    // the multi-parent reality).
+    const visited = new Set<string>([agent.id]);
+    const walk = (node: Agent) => {
+      node.config.tools.forEach((toolName) => {
+        const nid = `${node.id}::${toolName}`;
+        ns.push({ id: nid, type: "tool", data: { label: toolName, toolName, displayName: toolDisplayMap[toolName] ?? toolName, ownerAgentId: node.id, description: toolDescMap[toolName] ?? "" }, position: { x: 0, y: 0 } });
+        es.push({ id: `e:${node.id}->${nid}`, source: node.id, target: nid, style: { stroke: "#10b981", strokeWidth: 2 } });
       });
-      sub.config.mcp_servers.forEach((serverId) => {
+      node.config.mcp_servers.forEach((serverId) => {
         const server = mcpServers.find((s) => s.id === serverId);
         if (!server) return;
         const tools = mcpToolsMap[serverId]?.tools.map((t) => t.name) ?? [];
-        const nid = `mcp::${sub.id}::${serverId}`;
-        ns.push({ id: nid, type: "mcp", data: { label: server.name, serverId, tools }, position: { x: 0, y: 0 } });
-        es.push({ id: `e:${sub.id}->${nid}`, source: sub.id, target: nid, style: { stroke: "#f59e0b", strokeWidth: 2, strokeDasharray: "6,3" } });
+        const nid = `mcp::${node.id}::${serverId}`;
+        ns.push({ id: nid, type: "mcp", data: { label: server.name, serverId, tools, ownerAgentId: node.id }, position: { x: 0, y: 0 } });
+        es.push({ id: `e:${node.id}->${nid}`, source: node.id, target: nid, style: { stroke: "#f59e0b", strokeWidth: 2, strokeDasharray: "6,3" } });
       });
-    });
-
-    agent.config.mcp_servers.forEach((serverId) => {
-      const server = mcpServers.find((s) => s.id === serverId);
-      if (!server) return;
-      const tools = mcpToolsMap[serverId]?.tools.map((t) => t.name) ?? [];
-      const nid = `mcp::${serverId}`;
-      ns.push({ id: nid, type: "mcp", data: { label: server.name, serverId, tools }, position: { x: 0, y: 0 } });
-      es.push({ id: `e:${agent.id}->${nid}`, source: agent.id, target: nid, style: { stroke: "#f59e0b", strokeWidth: 2, strokeDasharray: "6,3" } });
-    });
+      node.config.subagents.forEach((subId) => {
+        const sub = allAgents.find((a) => a.id === subId);
+        if (!sub || visited.has(sub.id)) return;
+        visited.add(sub.id);
+        ns.push({ id: sub.id, type: "sub-agent", data: { label: sub.name, role: sub.config.role, parentAgentId: node.id }, position: { x: 0, y: 0 } });
+        es.push({ id: `e:${node.id}->${sub.id}`, source: node.id, target: sub.id, style: { stroke: "#3b82f6", strokeWidth: 2 } });
+        walk(sub);
+      });
+    };
+    walk(agent);
 
     return { nodes: layoutNodes(ns, es), edges: es };
   }, [agent, allAgents, toolDescMap, mcpServers, mcpToolsMap]);
@@ -604,7 +612,13 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
   const panelTools = registryTools;
   // Sub-Agents picker: show only non-root agents (sub-agents) and exclude the current canvas root.
   // Excludes OTHER pipelines' main agents — they're pipeline owners, not attachable sub-agents.
-  const panelAgents = allAgents.filter((a) => a.id !== agent.id && !isPipelineRoot(a, allAgents));
+  // Hide the source agent (whoever's "+" opened the panel) from its own
+  // attach list — you can't attach a node to itself. Roots and the canvas's
+  // own root are already excluded.
+  const _panelSourceId = addPanel?.sourceAgentId ?? agent.id;
+  const panelAgents = allAgents.filter((a) =>
+    a.id !== agent.id && a.id !== _panelSourceId && !isPipelineRoot(a, allAgents),
+  );
   const panelMCPServers = mcpServers;
 
   // ── Tool config dialog handlers ────────────────────────────────────────────
@@ -718,7 +732,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
       });
       const newAgent = await apiCreateAgent(token!, config);
       await qc.invalidateQueries({ queryKey: ["agents"] });
-      await addSubagent(newAgent.id);
+      await addSubagent(newAgent.id, addPanel?.sourceAgentId ?? agent.id);
       setAgentCreateOpen(false);
       setAgentForm(DEFAULT_AGENT_FORM);
     } catch (e) {
@@ -731,7 +745,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
   // ── Agent edit (Sheet) ────────────────────────────────────────────────────
   const editAgent =
     propsTarget?.kind === "root-agent" ? agent
-    : propsTarget?.kind === "sub-agent" ? allAgents.find((a) => a.id === (propsTarget as { agentId: string }).agentId) ?? null
+    : propsTarget?.kind === "sub-agent" ? allAgents.find((a) => a.id === propsTarget.agentId) ?? null
     : null;
 
   async function handleEditSave(config: AgentConfig) {
@@ -779,6 +793,17 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
           </div>
         )}
 
+        {/* Tools & Agents button — opens the root's add-connection panel */}
+        {!addPanel && (
+          <button
+            onClick={() => onAdd(agent.id, true)}
+            className="absolute top-3 left-3 z-10 flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/95 border border-violet-200 shadow-sm text-xs font-semibold text-violet-700 hover:bg-violet-50 hover:border-violet-400 transition-all backdrop-blur-sm"
+          >
+            <span className="text-sm font-bold">+</span>
+            Tools &amp; Agents
+          </button>
+        )}
+
         {/* Legend — calm, neutral background, color dots only */}
         <div className="absolute top-3 right-3 bg-white/95 border border-zinc-200 rounded-lg px-3 py-2.5 text-[11px] shadow-sm backdrop-blur-sm space-y-1.5">
           <p className="font-bold text-[9px] uppercase tracking-[0.18em] text-zinc-400 mb-1.5">Legend</p>
@@ -803,10 +828,9 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
 
             <div className="flex-1 overflow-y-auto p-3 space-y-5">
 
-              {/* ── Agents section (root only) ────────────────────────────── */}
-              {addPanel.isRoot && (
-                <section>
-                  <SectionHeader label="Sub-Agents" count={panelAgents.length} />
+              {/* ── Sub-Agents section ─────────────────────────────────────── */}
+              <section>
+                <SectionHeader label="Sub-Agents" count={panelAgents.length} />
 
                   {/* Create new agent inline */}
                   {!agentCreateOpen ? (
@@ -922,7 +946,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                     <p className="text-xs text-muted-foreground text-center py-3">No other agents yet. Create one above.</p>
                   )}
                   {panelAgents.map((a) => {
-                    const attached = agent.config.subagents.includes(a.id);
+                    const attached = panelConfig?.subagents.includes(a.id) ?? false;
                     return (
                       <div
                         key={a.id}
@@ -939,27 +963,26 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                         </div>
                         {attached ? (
                           <button
-                            onClick={() => removeSubagent(a.id)}
-                            title="Detach from this pipeline — sub-agent stays in your account"
+                            onClick={() => removeSubagent(a.id, addPanel.sourceAgentId)}
+                            title="Detach from this parent — sub-agent stays in your account"
                             className="text-[10px] bg-blue-100 hover:bg-blue-500 hover:text-white text-blue-700 rounded-full px-2 py-0.5 font-medium shrink-0 transition-colors"
                           >Detach</button>
                         ) : (
                           <button
-                            onClick={() => addSubagent(a.id)}
-                            title="Attach to this pipeline"
+                            onClick={() => addSubagent(a.id, addPanel.sourceAgentId)}
+                            title="Attach to this parent"
                             className="text-[10px] bg-emerald-100 hover:bg-emerald-500 hover:text-white text-emerald-700 rounded-full px-2 py-0.5 font-medium shrink-0 transition-colors"
                           >Attach</button>
                         )}
                         <button
-                          onClick={() => deleteSubagentRegistration(a.id, a.name)}
+                          onClick={() => deleteSubagentRegistration(a.id, a.name, addPanel.sourceAgentId)}
                           title="Delete sub-agent — removes it from your account entirely"
                           className="size-5 rounded text-red-400 hover:text-white hover:bg-red-500 flex items-center justify-center text-sm font-bold shrink-0 transition-colors"
                         >×</button>
                       </div>
                     );
                   })}
-                </section>
-              )}
+              </section>
 
               {/* ── Internal tools section ─────────────────────────────────── */}
               <section>
@@ -1065,7 +1088,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                   <p className="text-xs text-muted-foreground text-center py-3">No MCP servers registered.</p>
                 )}
                 {panelMCPServers.map((server) => {
-                  const attached = agent.config.mcp_servers.includes(server.id);
+                  const attached = panelConfig?.mcp_servers.includes(server.id) ?? false;
                   const discovered = mcpToolsMap[server.id]?.tools ?? [];
                   return (
                     <div
@@ -1083,19 +1106,19 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                         </div>
                         {attached ? (
                           <button
-                            onClick={() => removeMCPServer(server.id)}
-                            title="Detach from this pipeline — server stays registered in your account"
+                            onClick={() => removeMCPServer(server.id, addPanel.sourceAgentId)}
+                            title="Detach from this parent — server stays registered in your account"
                             className="text-[10px] bg-amber-100 hover:bg-amber-500 hover:text-white text-amber-700 rounded-full px-2 py-0.5 font-medium shrink-0 transition-colors"
                           >Detach</button>
                         ) : (
                           <button
-                            onClick={() => addMCPServer(server.id)}
-                            title="Attach to this pipeline"
+                            onClick={() => addMCPServer(server.id, addPanel.sourceAgentId)}
+                            title="Attach to this parent"
                             className="text-[10px] bg-emerald-100 hover:bg-emerald-500 hover:text-white text-emerald-700 rounded-full px-2 py-0.5 font-medium shrink-0 transition-colors"
                           >Attach</button>
                         )}
                         <button
-                          onClick={() => deleteMCPRegistration(server.id, server.name)}
+                          onClick={() => deleteMCPRegistration(server.id, server.name, addPanel.sourceAgentId)}
                           title="Delete registration — removes the server from your account entirely"
                           className="size-5 rounded text-red-400 hover:text-white hover:bg-red-500 flex items-center justify-center text-sm font-bold shrink-0 transition-colors"
                         >×</button>
@@ -1296,7 +1319,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                         )}
                     </div>
                     <div className="pt-3 border-t">
-                      <Button size="sm" variant="destructive" onClick={() => removeMCPServer(ps.serverId)}>
+                      <Button size="sm" variant="destructive" onClick={() => removeMCPServer(ps.serverId, ps.ownerAgentId)}>
                         Disconnect Server
                       </Button>
                     </div>
@@ -1331,7 +1354,22 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                     </span>
                   </div>
                 </div>
-                <div className="p-4">
+                <div className="p-4 space-y-3">
+                  {propsTarget.kind === "sub-agent" && (
+                    <button
+                      onClick={() => {
+                        const parentId = propsTarget.parentAgentId;
+                        if (!confirm(
+                          `Remove "${editAgent.name}" and everything below it from this pipeline?\n` +
+                          `\nThe sub-agent (and any nested children) stay in your account — they just stop being visible on this canvas and stop running in this pipeline. You can re-attach them anytime.`,
+                        )) return;
+                        removeSubagent(editAgent.id, parentId);
+                      }}
+                      className="w-full px-4 py-2.5 rounded-lg bg-red-50 border border-red-200 text-red-600 hover:bg-red-500 hover:text-white hover:border-red-500 text-sm font-semibold transition-colors flex items-center justify-center gap-2"
+                    >
+                      <span>×</span> Remove subtree from this pipeline
+                    </button>
+                  )}
                   <AgentForm
                     agent={editAgent}
                     allAgents={allAgents.filter((a) => a.id !== editAgent.id)}

@@ -17,3 +17,12 @@ export async function getMe(token: string): Promise<User> {
   return apiFetch("/users/me", {}, token);
 }
 
+// `slack_user_id: null` clears the link; an absent key would JSON-stringify
+// to `{}` and the backend would no-op.
+export async function updateMe(
+  token: string,
+  patch: { name?: string; slack_user_id?: string | null },
+): Promise<User> {
+  return apiFetch("/users/me", { method: "PATCH", body: JSON.stringify(patch) }, token);
+}
+

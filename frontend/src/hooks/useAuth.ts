@@ -7,6 +7,7 @@ interface AuthCtx {
   user: User | null;
   login: (email: string, password: string) => Promise<void>;
   logout: () => void;
+  refreshUser: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthCtx | null>(null);
@@ -37,7 +38,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(null);
   }
 
-  return createElement(AuthContext.Provider, { value: { token, user, login, logout } }, children);
+  async function refreshUser() {
+    if (!token) return;
+    const fresh = await getMe(token);
+    setUser(fresh);
+  }
+
+  return createElement(AuthContext.Provider, { value: { token, user, login, logout, refreshUser } }, children);
 }
 
 export function useAuth(): AuthCtx {

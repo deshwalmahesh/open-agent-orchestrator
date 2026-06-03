@@ -411,7 +411,11 @@ function ReassignDialog({
           <div className="space-y-1">
             <Label>Pipeline</Label>
             <Select value={agentId} onValueChange={(v: string | null) => setAgentId(v ?? "")}>
-              <SelectTrigger><SelectValue placeholder="Select pipeline" /></SelectTrigger>
+              <SelectTrigger>
+                <SelectValue placeholder="Select pipeline">
+                  {pipelines.find((p) => p.id === agentId)?.name ?? "Select pipeline"}
+                </SelectValue>
+              </SelectTrigger>
               <SelectContent>
                 {pipelines.map((a) => (
                   <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>
@@ -506,7 +510,11 @@ function NewChatDialog({
             <div className="space-y-1">
               <Label>Pipeline *</Label>
               <Select value={agentId} onValueChange={(v: string | null) => setAgentId(v ?? "")}>
-                <SelectTrigger><SelectValue placeholder="Select pipeline" /></SelectTrigger>
+                <SelectTrigger>
+                  <SelectValue placeholder="Select pipeline">
+                    {pipelines.find((p) => p.id === agentId)?.name ?? "Select pipeline"}
+                  </SelectValue>
+                </SelectTrigger>
                 <SelectContent>
                   {pipelines.map((a) => (
                     <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>

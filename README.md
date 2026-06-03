@@ -15,16 +15,16 @@ cp .env.example .env && docker compose up
 Ordered by impact — most useful first.
 
 1. **Visual canvas for multi-agent pipelines.** React Flow + dagre. Drag a supervisor, attach sub-agents (recursive ReAct loops, depth-4 cap, cycles rejected at save), wire in built-in tools and MCP servers. Double-click to edit, hover to attach, color-coded by node type (supervisor > sub-agent > tool/MCP).
-2. **Multi-channel out of the box.** Web chat with file attachments (PDFs + images) AND Slack via Socket Mode (no public URL — Bolt + xapp-/xoxb- tokens). One pipeline can be Slack-active at a time; switch live without restart.
+2. **Multi-channel, one inbox.** Web chat with file attachments (PDFs + images) AND Slack via Socket Mode (no public URL — Bolt + xapp-/xoxb- tokens). Slack DMs land as `ChatDB` rows keyed by `(channel_id, thread_ts)` and show up in the web `/chats` sidebar alongside browser-started chats — so you can review, continue, or reassign a Slack thread from the platform. One pipeline can be Slack-active at a time; switch live without restart.
 3. **Bring-your-own LLM, any provider.** OpenAI, Anthropic, Google Gemini, vLLM, or anything OpenAI-compatible. Provider list is backend-driven (`GET /providers`) — add one with a one-line edit to `app/llm.py`. User-entered keys live in their browser localStorage (no server-side BYOK storage).
 4. **MCP integration.** Register external MCP servers, auto-discover their tools at attach time, bind them to any sub-agent. A sample MCP server is included for testing.
-5. **Reusable everything.** Sub-agents, tools, personas (named system prompts), skills (reusable knowledge docs), and tool credentials are all account-scoped and reusable across pipelines. Symmetric Attach / Detach / Delete UI on every reusable.
+5. **Reusable, modifiable pipelines.** Every agent is independently addressable: it can be a *root* (pipeline) AND simultaneously be wired into another pipeline as a sub-agent — no separate "template" type, no clone-to-fork (computed `pipeline = NOT referenced as subagent`). Sub-agents, tools, personas (named system prompts), skills (reusable knowledge docs), and tool credentials are all account-scoped, attachable to N pipelines, and modifiable in place — edits propagate to every pipeline that references them. Symmetric Attach / Detach / Delete UI on every reusable.
 6. **Live run monitoring.** SSE event stream per run: `run.started`, `tool.start`/`end`, `agent.message`, `usage`, `run.finished`. Backlog replay + live feed. Token accounting aggregates across sub-agent calls (contextvar propagation).
 7. **Draft → Deployed gating.** Pipelines start as Draft. They can't be used in chat or Slack until you explicitly click Deploy (which validates `llm.model`, `system_prompt`, sub-agent tree). Edits after deploy stay Deployed — no surprise re-validation.
 8. **Per-user tool credentials with pre-save validation.** `POST /tool-configs/{tool}/validate` pings the upstream (e.g. Tavily one-result search) before storing the key. Errors are scrubbed — submitted keys never bounce back to the client.
 9. **Rolling-summary memory.** N=10 verbatim tail, fold the oldest M=20 into `ChatDB.summary` once they exceed the threshold. `MessageDB` rows are never deleted (full audit trail).
 10. **Graceful recursion-limit fallback.** When LangGraph hits `max_steps`, the run finishes with a clean apology message instead of a half-baked tool-result tail.
-11. **Multi-user with JWT.** `fastapi-users` auth, per-user ownership on every row, `404 not 403` on cross-user reads (no existence leak).
+11. **Multi-user, multi-pipeline, multi-chat.** `fastapi-users` JWT auth. Each user owns N pipelines; each pipeline backs N chats (web + Slack threads); each chat carries its own `MessageDB` history + rolling summary. Cross-user reads return `404 not 403` (no existence leak). Reassigning a chat to a different Deployed pipeline is a single PATCH.
 12. **SQLite by default, Postgres by URL swap.** Idempotent migrations via SQLAlchemy `inspect()` — no Alembic in v1, no startup error logs from "column already exists".
 13. **Docker Compose dev loop.** Full bind mount + anonymous volumes for `node_modules` / `.venv` → `docker compose down && up` = truly fresh install; restarts in between are instant. Vite polling enabled so macOS Docker bind mounts hot-reload reliably.
 
@@ -87,39 +87,84 @@ docker-compose.yml                postgres + redis + backend + frontend + mcp-sa
 
 ## Architecture
 
+### System flow
+
 ```mermaid
 flowchart LR
   subgraph FE["Frontend (React + ReactFlow + TanStack Query)"]
-    PG[/Pipelines/]
-    CV[Canvas]
+    PG[/Pipelines list/]
+    CV[Canvas editor]
     CH[Chat + SSE]
     IN[Integrations]
+    PS[Personas / Skills]
   end
 
   subgraph BE["Backend (FastAPI + asyncio + LangGraph)"]
     API[REST routers]
     RS[run_service]
-    BA[build_agent_tree]
-    LL[ChatOpenAI / Anthropic / Gemini / vLLM]
-    TR[Tool registry + MCP]
-    SL[Slack Socket Mode]
-    EM[RunEventEmitter]
+    BA[build_agent_tree<br/>recursive ReAct, depth-4]
+    LL[ChatOpenAI / Anthropic<br/>Gemini / vLLM dispatch]
+    TR[Built-in tools<br/>+ MCP discovery]
+    SL[Slack Socket Mode<br/>single-owner bot]
+    EM[RunEventEmitter<br/>SSE fan-out]
   end
 
   subgraph DATA["Persistence"]
-    DB[(SQLAlchemy 2.0 async\nSQLite ↔ Postgres)]
-    RD[(Redis\ncheckpointer)]
+    DB[("SQLAlchemy 2.0 async<br/>SQLite ↔ Postgres<br/>UserDB · AgentDB · ChatDB<br/>MessageDB · RunDB · RunEventDB<br/>PersonaDB · SkillDB · MCPServerDB<br/>ToolConfigDB")]
+    RD[(Redis<br/>within-run checkpointer)]
   end
 
   FE -->|REST + SSE| API
   API --> RS --> BA --> LL
   BA --> TR
-  RS <--> DB
-  RS --> EM -->|SSE| FE
-  SL -->|inbound DM| RS
-  RS -->|reply| SL
+  RS <-->|sessions| DB
+  RS --> EM -->|SSE backlog + live| FE
+  SL -->|inbound DM ⇒ ChatDB| RS
+  RS -->|reply ⇒ same thread| SL
   BA -.checkpoint.-> RD
+  IN -->|connect/disconnect/active| API
+  PS -->|reusables attach to N pipelines| API
 ```
+
+### Data model (multi-user → multi-pipeline → multi-chat)
+
+```mermaid
+flowchart TD
+  U["UserDB<br/>(JWT identity + optional slack_user_id)"]
+  A1["AgentDB<br/>(root = pipeline)"]
+  A2["AgentDB<br/>(sub-agent)"]
+  A3["AgentDB<br/>(sub-agent — shared)"]
+  CH1["ChatDB<br/>channel='web'"]
+  CH2["ChatDB<br/>channel='slack'<br/>external_thread_id=C123:1.234"]
+  CH3["ChatDB<br/>channel='web'"]
+  M["MessageDB<br/>(append-only, full audit)"]
+  R["RunDB + RunEventDB<br/>(status, tokens, SSE backlog)"]
+  P["PersonaDB / SkillDB<br/>(account-scoped, attach to N agents)"]
+  MCP["MCPServerDB / ToolConfigDB<br/>(per-user creds, validated pre-save)"]
+
+  U -- owns N --> A1
+  U -- owns N --> A2
+  U -- owns N --> A3
+  A1 -- references --> A2
+  A1 -- references --> A3
+  A2 -- can also be a pipeline root --> CH3
+  A1 -- backs N --> CH1
+  A1 -- backs N (Slack threads) --> CH2
+  CH1 -- has many --> M
+  CH2 -- has many --> M
+  CH1 -- triggers --> R
+  CH2 -- triggers --> R
+  A1 -. uses .- P
+  A1 -. uses .- MCP
+```
+
+Key relationships:
+- **User → Pipelines:** one user owns many root agents (pipelines). The same `AgentDB` row can be a root AND be referenced as a sub-agent by another pipeline — no `is_pipeline` flag, computed on read.
+- **Pipeline → Chats:** one pipeline backs many chats. Web chats are user-created; Slack chats auto-spawn on first DM, keyed by `(channel_id, thread_ts)` — they appear in the same `/chats` sidebar.
+- **Chat → Messages:** append-only `MessageDB` for full audit; older messages fold into `ChatDB.summary` (N=10 tail, M=20 fold).
+- **Reusables:** Sub-agents, personas, skills, MCP servers, and tool credentials are user-scoped and can be attached to any number of pipelines; edits propagate live.
+
+### Layering
 
 Three boundaries, kept thin:
 - **Control plane** (`api/`) — body validation, owner checks, call repos/services.

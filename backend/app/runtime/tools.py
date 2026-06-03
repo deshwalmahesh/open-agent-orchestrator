@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import sys
 
+import httpx
 import numexpr
 import structlog
 from langchain.tools import tool
@@ -37,6 +38,15 @@ def pdf_to_text(path: str) -> str:
     """Extract text from a PDF at the given local file path."""
     reader = PdfReader(path)
     return "\n\n".join((p.extract_text() or "") for p in reader.pages)
+
+
+@tool
+async def fetch_page(url: str) -> str:
+    """Fetch the raw HTML of a URL. Follows redirects, 10s timeout. Returns the response body as a string."""
+    async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.text
 
 
 @tool
@@ -74,6 +84,7 @@ DISPLAY_NAMES: dict[str, str] = {
     "html_to_markdown": "HTML → Markdown",
     "pdf_to_text": "PDF → Text",
     "python_sandbox": "Python Sandbox",
+    "fetch_page": "Fetch Page",
 }
 
 
@@ -86,6 +97,7 @@ def build_registry(*, tool_configs: dict[str, dict] | None = None) -> dict[str, 
         "html_to_markdown": html_to_markdown,
         "pdf_to_text": pdf_to_text,
         "python_sandbox": python_sandbox,
+        "fetch_page": fetch_page,
     }
     configs = tool_configs or {}
     tavily_key = configs.get("web_search", {}).get("api_key")

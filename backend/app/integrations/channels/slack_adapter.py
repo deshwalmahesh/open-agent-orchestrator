@@ -141,8 +141,9 @@ async def handle_slack_message(
             await say(
                 thread_ts=thread_ts,
                 text=(
-                    "I don't recognise you. Register on the web app and set "
-                    "your Slack ID via `PATCH /users/me {slack_user_id}`."
+                    "I don't recognise this Slack account yet. "
+                    "Open the web app → Integrations → Link Slack, paste your Slack member ID "
+                    f"(yours is `{slack_uid}`), and I'll route your messages from then on."
                 ),
             )
             return
@@ -151,7 +152,7 @@ async def handle_slack_message(
         if agent is None:
             await say(
                 thread_ts=thread_ts,
-                text="You don't have any agents yet. Create one via `POST /agents`.",
+                text="You don't have any deployed pipelines yet. Create one in the web app — Pipelines → New Pipeline → Deploy.",
             )
             return
 

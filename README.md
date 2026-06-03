@@ -2,6 +2,8 @@
 
 Visual multi-agent pipelines (you know them as "Multi Agent workflows"). Build a supervisor with sub-agents, tools, and MCP servers on a canvas. Talk to it from the web or Slack. Works with any OpenAI-compatible LLM, Anthropic, or Gemini.
 
+![Canvas](assets/canvas.png)
+
 ```bash
 cp .env.example .env && docker compose up
 ```

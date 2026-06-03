@@ -23,7 +23,7 @@ from pypdf import PdfReader
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session_factory
-from app.db.models import AgentDB, ChatDB, PersonaDB, SkillDB
+from app.db.models import AgentDB, ChatDB, SkillDB
 from app.db.repos import (
     create_run,
     finalize_run,
@@ -135,11 +135,9 @@ async def _load_chat_and_agent(
         raise ValueError(f"agent not found: {chat.agent_id}")
     cfg = AgentConfig.model_validate(agent_row.config)
 
+    # Persona belongs to the agent (its system_prompt was already set from the
+    # picked persona at form-save time). No chat-level persona override.
     effective_prompt = cfg.system_prompt
-    if chat.persona_id is not None:
-        persona = await session.get(PersonaDB, chat.persona_id)
-        if persona is not None:
-            effective_prompt = persona.system_prompt
 
     # Inject skill documents into the prompt
     for skill_id in cfg.skills:

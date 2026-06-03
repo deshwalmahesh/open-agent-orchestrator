@@ -11,3 +11,15 @@ export async function createPersona(
 ): Promise<Persona> {
   return apiFetch("/personas", { method: "POST", body: JSON.stringify(data) }, token);
 }
+
+export async function updatePersona(
+  token: string,
+  id: string,
+  data: { name: string; system_prompt: string },
+): Promise<Persona> {
+  return apiFetch(`/personas/${id}`, { method: "PUT", body: JSON.stringify(data) }, token);
+}
+
+export async function deletePersona(token: string, id: string): Promise<void> {
+  return apiFetch(`/personas/${id}`, { method: "DELETE" }, token);
+}

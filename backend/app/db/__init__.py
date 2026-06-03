@@ -65,6 +65,17 @@ async def create_all() -> None:
                     await conn.execute(text(f'ALTER TABLE "user" ADD COLUMN {col}'))
             except (OperationalError, ProgrammingError):
                 pass
+        # Drop obsolete columns. Idempotent via SAVEPOINT — already-dropped
+        # raises, which we swallow. Persona moved from per-chat to per-agent
+        # ownership; persona_id on chats is dead code.
+        for stmt in (
+            'ALTER TABLE chats DROP COLUMN persona_id',
+        ):
+            try:
+                async with conn.begin_nested():
+                    await conn.execute(text(stmt))
+            except (OperationalError, ProgrammingError):
+                pass
 
 
 _PERSONAS_YAML = Path(__file__).parent / "seeds" / "personas.yaml"
@@ -85,6 +96,7 @@ async def seed_defaults() -> None:
     if not entries:
         return
 
+    yaml_names = {entry["name"] for entry in entries}
     async with get_session_factory()() as session:
         for entry in entries:
             name = entry["name"]
@@ -100,4 +112,15 @@ async def seed_defaults() -> None:
             elif row.system_prompt != prompt:
                 row.system_prompt = prompt
                 log.info("db.seed.persona_updated", name=name)
+        # Drop any global personas no longer present in the YAML — they're
+        # leftovers from earlier seed code. YAML is the source of truth.
+        orphans = (await session.execute(
+            select(PersonaDB).where(
+                PersonaDB.user_id.is_(None),
+                PersonaDB.name.not_in(yaml_names),
+            )
+        )).scalars().all()
+        for row in orphans:
+            log.info("db.seed.persona_removed_orphan", name=row.name)
+            await session.delete(row)
         await session.commit()

@@ -13,7 +13,6 @@ import { Separator } from "@/components/ui/separator";
 import RunEventsPanel from "@/components/RunEventsPanel";
 import { listChats, createChat, deleteChat, patchChat, getMessages, sendMessage, type FileAttachment } from "@/api/chats";
 import { listAgents } from "@/api/agents";
-import { listPersonas, createPersona } from "@/api/personas";
 import { useAuth } from "@/hooks/useAuth";
 import { useSSE } from "@/hooks/useSSE";
 import type { Message } from "@/types";
@@ -386,14 +385,8 @@ function NewChatDialog({
   onCreated: (id: string) => void;
 }) {
   const [agentId, setAgentId] = useState("");
-  const [personaId, setPersonaId] = useState("");
   const [title, setTitle] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const [createPersonaOpen, setCreatePersonaOpen] = useState(false);
-  const [personaName, setPersonaName] = useState("");
-  const [personaPrompt, setPersonaPrompt] = useState("");
-  const [creatingPersona, setCreatingPersona] = useState(false);
-  const qc = useQueryClient();
 
   const { data: agents = [] } = useQuery({
     queryKey: ["agents"],
@@ -404,44 +397,16 @@ function NewChatDialog({
   // New chat picks a pipeline (root), not an internal sub-agent.
   const pipelines = agents.filter((a) => isPipelineRoot(a, agents));
 
-  const { data: personas = [] } = useQuery({
-    queryKey: ["personas"],
-    queryFn: () => listPersonas(token),
-    enabled: open,
-  });
-
-  // Default-select the first persona once the list loads (typically "Default Supervisor").
-  useEffect(() => {
-    if (!personaId && personas.length > 0) setPersonaId(personas[0].id);
-  }, [personas, personaId]);
-
-  async function handleCreatePersona() {
-    if (!personaName.trim() || !personaPrompt.trim()) return;
-    setCreatingPersona(true);
-    try {
-      const p = await createPersona(token, { name: personaName.trim(), system_prompt: personaPrompt.trim() });
-      await qc.invalidateQueries({ queryKey: ["personas"] });
-      setPersonaId(p.id);
-      setCreatePersonaOpen(false);
-      setPersonaName(""); setPersonaPrompt("");
-    } catch (err) {
-      console.error("Create persona failed:", err);
-    } finally {
-      setCreatingPersona(false);
-    }
-  }
-
   async function handleCreate() {
     if (!agentId) return;
     setSubmitting(true);
     try {
       const chat = await createChat(token, {
         agent_id: agentId,
-        persona_id: personaId || undefined,
         title: title.trim() || undefined,
       });
       onCreated(chat.id);
-      setAgentId(""); setPersonaId(""); setTitle("");
+      setAgentId(""); setTitle("");
     } catch (err) {
       console.error("Create chat failed:", err);
     } finally {
@@ -471,71 +436,6 @@ function NewChatDialog({
           <div className="space-y-1">
             <Label>Title (optional)</Label>
             <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="My research task" />
-          </div>
-
-          <Separator />
-
-          <div className="space-y-1">
-            <div className="flex items-center justify-between">
-              <Label>Persona (system prompt)</Label>
-              {!createPersonaOpen && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="text-xs"
-                  onClick={() => setCreatePersonaOpen(true)}
-                >
-                  + Create persona
-                </Button>
-              )}
-            </div>
-            {createPersonaOpen ? (
-              <div className="space-y-2 border rounded-md p-3 bg-muted/30">
-                <Input
-                  value={personaName}
-                  onChange={(e) => setPersonaName(e.target.value)}
-                  placeholder="Persona name (e.g. Strict Code Reviewer)"
-                  autoFocus
-                />
-                <Textarea
-                  value={personaPrompt}
-                  onChange={(e) => setPersonaPrompt(e.target.value)}
-                  placeholder="You are…"
-                  rows={3}
-                  className="resize-none"
-                />
-                <div className="flex gap-2">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="flex-none"
-                    onClick={() => { setCreatePersonaOpen(false); setPersonaName(""); setPersonaPrompt(""); }}
-                  >
-                    Cancel
-                  </Button>
-                  <Button
-                    size="sm"
-                    className="flex-1"
-                    onClick={handleCreatePersona}
-                    disabled={creatingPersona || !personaName.trim() || !personaPrompt.trim()}
-                  >
-                    {creatingPersona ? "Saving…" : "Save & use"}
-                  </Button>
-                </div>
-              </div>
-            ) : (
-              <Select value={personaId} onValueChange={(v: string | null) => setPersonaId(v ?? "")}>
-                <SelectTrigger><SelectValue placeholder="Select persona" /></SelectTrigger>
-                <SelectContent>
-                  {personas.map((p) => (
-                    <SelectItem key={p.id} value={p.id}>
-                      {p.name}{p.owner_id === null ? " (default)" : ""}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
           </div>
 
           <Button className="w-full" onClick={handleCreate} disabled={!agentId || submitting}>

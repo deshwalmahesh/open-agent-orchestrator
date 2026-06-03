@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { useQuery } from "@tanstack/react-query";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -5,15 +6,15 @@ import { z } from "zod";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
 import { Separator } from "@/components/ui/separator";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { listTools } from "@/api/tools";
+import PersonaPopup from "@/components/PersonaPopup";
 import { listSkills } from "@/api/skills";
+import { listPersonas } from "@/api/personas";
 import { useAuth } from "@/hooks/useAuth";
-import { cn } from "@/lib/utils";
+import { cn, isPipelineRoot } from "@/lib/utils";
 import { getLLMDefaults, saveLLMDefaults } from "@/lib/llm-defaults";
-import type { Agent, AgentConfig } from "@/types";
+import type { Agent, AgentConfig, Persona } from "@/types";
 
 // ─── Provider quick-select ────────────────────────────────────────────────────
 const PROVIDER_PRESETS = [
@@ -24,12 +25,13 @@ const PROVIDER_PRESETS = [
 ] as const;
 
 // ─── Zod schema ───────────────────────────────────────────────────────────────
-// Name + role intentionally NOT required: for a root pipeline the supervisor's
-// identity-naming friction was reported as overload. Defaults fill in if blank.
+// system_prompt is no longer a form field — it's derived from the picked persona
+// at save time. The user picks/creates a persona via PersonaPopup and that
+// becomes the agent's prompt. Allows custom legacy prompts to be preserved when
+// no persona id is selected (formToConfig falls back to existing.system_prompt).
 const schema = z.object({
   name: z.string(),
   role: z.string(),
-  system_prompt: z.string().min(1, "Required"),
   llm_base_url: z.string().min(1, "Required"),
   llm_api_key: z.string(),
   llm_model: z.string().min(1, "Required"),
@@ -50,7 +52,6 @@ function configToForm(config: AgentConfig): FormValues {
   return {
     name: config.name,
     role: config.role,
-    system_prompt: config.system_prompt,
     llm_base_url: config.llm.base_url,
     llm_api_key: config.llm.api_key,
     llm_model: config.llm.model,
@@ -66,12 +67,16 @@ function configToForm(config: AgentConfig): FormValues {
   };
 }
 
-function formToConfig(values: FormValues, existing?: AgentConfig): AgentConfig {
+function formToConfig(
+  values: FormValues,
+  systemPrompt: string,
+  existing?: AgentConfig,
+): AgentConfig {
   return {
     name: values.name.trim() || existing?.name || "Pipeline",
     role: values.role.trim() || existing?.role || "supervisor",
     description: existing?.description ?? null,
-    system_prompt: values.system_prompt,
+    system_prompt: systemPrompt,
     llm: {
       base_url: values.llm_base_url,
       api_key: values.llm_api_key || "EMPTY",
@@ -102,7 +107,6 @@ function getDefaultValues(): FormValues {
   return {
     name: "",
     role: "supervisor",
-    system_prompt: "You are a helpful assistant.",
     llm_base_url: llm.base_url,
     llm_api_key: llm.api_key,
     llm_model: llm.model,
@@ -139,27 +143,51 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
     defaultValues: agent ? configToForm(agent.config) : getDefaultValues(),
   });
 
-  const { data: tools = [] } = useQuery({
-    queryKey: ["tools"],
-    queryFn: listTools,
-    staleTime: Infinity,
-  });
-
   const { data: skillsList = [] } = useQuery({
     queryKey: ["skills"],
     queryFn: () => listSkills(token!),
     enabled: !!token,
   });
 
+  const { data: personas = [] } = useQuery({
+    queryKey: ["personas"],
+    queryFn: () => listPersonas(token!),
+    enabled: !!token,
+  });
+
+  // Persona selection lives outside react-hook-form because PersonaPopup
+  // controls it directly (mutations return the saved persona).
+  const [personaId, setPersonaId] = useState<string>("");
+  // Popup state. "new" = create empty; Persona = edit-in-place or copy-from-global.
+  const [popup, setPopup] = useState<Persona | "new" | null>(null);
+
+  // When personas load (or agent changes), try to auto-select the persona whose
+  // system_prompt matches the agent's current prompt. If none match, leave
+  // personaId="" — the existing prompt is preserved on save (custom prompt path).
+  useEffect(() => {
+    if (personas.length === 0) return;
+    if (personaId) return;
+    if (agent?.config.system_prompt) {
+      const match = personas.find((p) => p.system_prompt === agent.config.system_prompt);
+      if (match) setPersonaId(match.id);
+    }
+  }, [personas, agent, personaId]);
+
   const memType = watch("memory_type");
   const temperature = watch("llm_temperature");
-  const selectedTools = watch("tools");
   const selectedSkills = watch("skills");
   const selectedSubagents = watch("subagents");
   const currentBaseUrl = watch("llm_base_url");
 
   const isPaid = (user?.plan ?? "free") !== "free";
   const subagentOptions = allAgents.filter((a) => a.id !== agent?.id);
+
+  // Root pipeline: hide Role (canvas always labels root "Supervisor"). For a
+  // brand-new agent (no agent prop), assume root — that's the create path on
+  // /pipelines. Sub-agent: keep Role visible so its role can describe its job.
+  const isRoot = !agent || isPipelineRoot(agent, allAgents);
+
+  const selectedPersona = personas.find((p) => p.id === personaId);
 
   function toggleItem(field: "tools" | "skills" | "subagents", id: string, checked: boolean) {
     const current = { tools: selectedTools, skills: selectedSkills, subagents: selectedSubagents }[field];
@@ -183,7 +211,15 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
       temperature: values.llm_temperature,
       max_tokens: values.llm_max_tokens,
     });
-    await onSubmit(formToConfig(values, agent?.config));
+    // If a persona is picked, its prompt becomes the agent's prompt. If none
+    // is picked (custom prompt path), keep whatever the existing agent had —
+    // or fall back to the first persona's prompt for a brand-new agent.
+    const systemPrompt =
+      selectedPersona?.system_prompt
+      ?? agent?.config.system_prompt
+      ?? personas[0]?.system_prompt
+      ?? "You are a helpful assistant.";
+    await onSubmit(formToConfig(values, systemPrompt, agent?.config));
   }
 
   return (
@@ -192,25 +228,69 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
       {/* ── Identity ──────────────────────────────────────────────────────── */}
       <section>
         <h3 className="text-xs font-bold uppercase tracking-wider text-gray-400 mb-3">Identity</h3>
-        <div className="grid grid-cols-2 gap-3">
+        <div className={cn("grid gap-3", isRoot ? "grid-cols-1" : "grid-cols-2")}>
           <div className="space-y-1.5">
             <Label className="text-xs font-semibold text-gray-600">Name</Label>
             <Input {...register("name")} placeholder="Pipeline" className="focus-visible:ring-violet-300" />
           </div>
-          <div className="space-y-1.5">
-            <Label className="text-xs font-semibold text-gray-600">Role</Label>
-            <Input {...register("role")} placeholder="supervisor" className="focus-visible:ring-violet-300" />
-          </div>
+          {!isRoot && (
+            <div className="space-y-1.5">
+              <Label className="text-xs font-semibold text-gray-600">Role</Label>
+              <Input {...register("role")} placeholder="assistant" className="focus-visible:ring-violet-300" />
+            </div>
+          )}
         </div>
+
+        {/* Persona — replaces the System Prompt textarea. The picked persona's
+            prompt becomes the agent's system prompt at save time. */}
         <div className="mt-3 space-y-1.5">
-          <Label className="text-xs font-semibold text-gray-600">System Prompt *</Label>
-          <Textarea
-            {...register("system_prompt")}
-            rows={4}
-            placeholder="You are a helpful assistant with expertise in…"
-            className="focus-visible:ring-violet-300 resize-none text-sm"
-          />
-          {errors.system_prompt && <p className="text-xs text-destructive">{errors.system_prompt.message}</p>}
+          <div className="flex items-center justify-between">
+            <Label className="text-xs font-semibold text-gray-600">Persona</Label>
+            <div className="flex gap-2">
+              {selectedPersona && selectedPersona.owner_id !== null && (
+                <button
+                  type="button"
+                  onClick={() => setPopup(selectedPersona)}
+                  className="text-[11px] text-violet-600 hover:underline"
+                >
+                  Edit
+                </button>
+              )}
+              {selectedPersona && selectedPersona.owner_id === null && (
+                <button
+                  type="button"
+                  onClick={() => setPopup(selectedPersona)}
+                  className="text-[11px] text-violet-600 hover:underline"
+                >
+                  Copy
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setPopup("new")}
+                className="text-[11px] text-violet-600 hover:underline"
+              >
+                + New
+              </button>
+            </div>
+          </div>
+          <select
+            value={personaId}
+            onChange={(e) => setPersonaId(e.target.value)}
+            className="w-full h-9 border border-input rounded-md px-2 text-sm bg-background focus-visible:ring-2 focus-visible:ring-violet-300"
+          >
+            <option value="">— Custom prompt (keep existing) —</option>
+            {personas.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}{p.owner_id === null ? " (default)" : ""}
+              </option>
+            ))}
+          </select>
+          {selectedPersona && (
+            <p className="text-[11px] text-muted-foreground whitespace-pre-wrap line-clamp-4 bg-gray-50 border border-gray-200 rounded-lg p-2 mt-1">
+              {selectedPersona.system_prompt}
+            </p>
+          )}
         </div>
       </section>
 
@@ -322,43 +402,6 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
             </div>
           </CollapsibleContent>
         </Collapsible>
-      </section>
-
-      <Separator />
-
-      {/* ── Tools (chip toggles) ──────────────────────────────────────────── */}
-      <section>
-        <div className="flex items-center mb-3">
-          <h3 className="text-xs font-bold uppercase tracking-wider text-gray-400 flex-1">Tools</h3>
-          {selectedTools.length > 0 && (
-            <span className="text-xs text-emerald-600 font-medium">{selectedTools.length} selected</span>
-          )}
-        </div>
-        {tools.length === 0 ? (
-          <p className="text-xs text-muted-foreground">Loading tools…</p>
-        ) : (
-          <div className="flex flex-wrap gap-2">
-            {tools.map((t) => {
-              const active = selectedTools.includes(t.name);
-              return (
-                <button
-                  key={t.name}
-                  type="button"
-                  title={t.description}
-                  onClick={() => toggleItem("tools", t.name, !active)}
-                  className={cn(
-                    "px-3 py-1.5 rounded-full border text-xs font-medium transition-all",
-                    active
-                      ? "border-emerald-400 bg-emerald-50 text-emerald-700"
-                      : "border-gray-200 text-gray-500 hover:border-emerald-200 hover:bg-emerald-50/50",
-                  )}
-                >
-                  {t.display_name}
-                </button>
-              );
-            })}
-          </div>
-        )}
       </section>
 
       <Separator />
@@ -492,6 +535,17 @@ export default function AgentForm({ agent, allAgents, onSubmit, onCancel, submit
           Cancel
         </Button>
       </div>
+
+      <PersonaPopup
+        open={popup !== null}
+        initial={popup === "new" ? null : popup}
+        onClose={() => setPopup(null)}
+        onSaved={(p) => setPersonaId(p.id)}
+        onDeleted={(deletedId) => {
+          // If the deleted persona was selected, drop selection so save uses fallback.
+          if (personaId === deletedId) setPersonaId("");
+        }}
+      />
     </form>
   );
 }

@@ -17,32 +17,9 @@ def test_create_chat_with_agent_only(client, signup_and_login, auth_header, samp
     assert r.status_code == 201, r.text
     body = r.json()
     assert body["agent_id"] == agent_id
-    assert body["persona_id"] is None
+    assert "persona_id" not in body
     assert body["title"] == "First chat"
     assert body["channel"] == "web"
-
-
-def test_create_chat_with_own_persona(client, signup_and_login, auth_header, sample_agent_config):
-    token = signup_and_login()
-    h = auth_header(token)
-    agent_id = _create_agent(client, token, auth_header, sample_agent_config)
-    persona = client.post("/personas", json={"name": "Brief", "system_prompt": "Be brief."}, headers=h).json()
-    r = client.post("/chats", json={"agent_id": agent_id, "persona_id": persona["id"]}, headers=h)
-    assert r.status_code == 201
-    assert r.json()["persona_id"] == persona["id"]
-
-
-def test_create_chat_with_global_persona_ok(
-    client, signup_and_login, auth_header, sample_agent_config, insert_global_persona
-):
-    global_pid = insert_global_persona()
-    token = signup_and_login()
-    agent_id = _create_agent(client, token, auth_header, sample_agent_config)
-    r = client.post(
-        "/chats", json={"agent_id": agent_id, "persona_id": global_pid}, headers=auth_header(token)
-    )
-    assert r.status_code == 201
-    assert r.json()["persona_id"] == global_pid
 
 
 def test_create_chat_404_when_agent_not_mine(client, signup_and_login, auth_header, sample_agent_config):
@@ -51,21 +28,6 @@ def test_create_chat_404_when_agent_not_mine(client, signup_and_login, auth_head
     agent_id = _create_agent(client, alice, auth_header, sample_agent_config)
     # Bob can't attach Alice's agent to his chat.
     assert client.post("/chats", json={"agent_id": agent_id}, headers=auth_header(bob)).status_code == 404
-
-
-def test_create_chat_404_when_persona_not_mine(client, signup_and_login, auth_header, sample_agent_config):
-    alice = signup_and_login("alice@example.com")
-    bob = signup_and_login("bob@example.com")
-    alice_persona = client.post(
-        "/personas", json={"name": "Mine", "system_prompt": "x"}, headers=auth_header(alice)
-    ).json()
-    bob_agent = _create_agent(client, bob, auth_header, sample_agent_config)
-    r = client.post(
-        "/chats",
-        json={"agent_id": bob_agent, "persona_id": alice_persona["id"]},
-        headers=auth_header(bob),
-    )
-    assert r.status_code == 404
 
 
 def test_create_chat_404_when_agent_does_not_exist(client, signup_and_login, auth_header):

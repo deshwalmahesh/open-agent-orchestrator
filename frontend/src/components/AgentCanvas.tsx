@@ -22,7 +22,8 @@ import { updateAgent, createAgent as apiCreateAgent } from "@/api/agents";
 import { listTools } from "@/api/tools";
 import { listMCPServers, discoverMCPTools, createMCPServer } from "@/api/mcp-servers";
 import { listToolConfigs, upsertToolConfig, validateToolConfig } from "@/api/tool-configs";
-import { listPersonas, createPersona } from "@/api/personas";
+import { listPersonas } from "@/api/personas";
+import PersonaPopup from "@/components/PersonaPopup";
 import { useAuth } from "@/hooks/useAuth";
 import { cn, isPipelineRoot } from "@/lib/utils";
 import { saveLLMDefaults } from "@/lib/llm-defaults";
@@ -307,11 +308,8 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
   const [agentForm, setAgentForm] = useState<CreateAgentForm>(DEFAULT_AGENT_FORM);
   const [creatingAgent, setCreatingAgent] = useState(false);
 
-  // Inline persona creation (nested inside the agent-create form)
-  const [personaCreateOpen, setPersonaCreateOpen] = useState(false);
-  const [newPersonaName, setNewPersonaName] = useState("");
-  const [newPersonaPrompt, setNewPersonaPrompt] = useState("");
-  const [creatingPersona, setCreatingPersona] = useState(false);
+  // Persona popup state — opens from the agent-create form's "+ New" link
+  const [personaPopupOpen, setPersonaPopupOpen] = useState(false);
 
   // Inline MCP registration (inside left panel's MCP section)
   const [mcpRegOpen, setMcpRegOpen] = useState(false);
@@ -338,10 +336,12 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
     staleTime: 60_000,
   });
 
-  // Default-select the first persona (typically the seeded Default Supervisor) when none picked.
+  // Default-select 'Default - Sub Agent' for new sub-agents; fall back to the
+  // first persona if the seed is missing for some reason.
   useEffect(() => {
     if (!agentForm.personaId && personas.length > 0) {
-      setAgentForm((f) => ({ ...f, personaId: personas[0].id }));
+      const seed = personas.find((p) => p.name === "Default - Sub Agent") ?? personas[0];
+      setAgentForm((f) => ({ ...f, personaId: seed.id }));
     }
   }, [personas, agentForm.personaId]);
 
@@ -616,22 +616,6 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
     }
   }
 
-  async function handleCreatePersonaInline() {
-    if (!newPersonaName.trim() || !newPersonaPrompt.trim()) return;
-    setCreatingPersona(true);
-    try {
-      const p = await createPersona(token!, { name: newPersonaName.trim(), system_prompt: newPersonaPrompt.trim() });
-      await qc.invalidateQueries({ queryKey: ["personas"] });
-      setAgentForm((f) => ({ ...f, personaId: p.id }));
-      setPersonaCreateOpen(false);
-      setNewPersonaName(""); setNewPersonaPrompt("");
-    } catch (e) {
-      console.error("Failed to create persona:", e);
-    } finally {
-      setCreatingPersona(false);
-    }
-  }
-
   // ── Create new agent inline handler ───────────────────────────────────────
   async function handleSubmitNewAgent() {
     if (!agentForm.name.trim() || !agentForm.base_url.trim() || !agentForm.model.trim() || !agentForm.personaId) return;
@@ -830,61 +814,25 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                       <div>
                         <div className="flex items-center justify-between mb-1">
                           <Label className="text-[11px] text-gray-600">Persona (system prompt) *</Label>
-                          {!personaCreateOpen && (
-                            <button
-                              type="button"
-                              onClick={() => setPersonaCreateOpen(true)}
-                              className="text-[11px] text-blue-600 hover:underline"
-                            >
-                              + Create persona
-                            </button>
-                          )}
-                        </div>
-                        {personaCreateOpen ? (
-                          <div className="space-y-1.5 border border-blue-200 rounded-md p-2 bg-blue-50/30">
-                            <Input
-                              value={newPersonaName}
-                              onChange={(e) => setNewPersonaName(e.target.value)}
-                              placeholder="Persona name"
-                              className="h-7 text-xs"
-                              autoFocus
-                            />
-                            <textarea
-                              value={newPersonaPrompt}
-                              onChange={(e) => setNewPersonaPrompt(e.target.value)}
-                              placeholder="You are…"
-                              rows={3}
-                              className="w-full border border-input rounded-md px-2 py-1 text-xs bg-background resize-none focus:outline-none focus:ring-1 focus:ring-blue-300"
-                            />
-                            <div className="flex gap-1">
-                              <button
-                                type="button"
-                                onClick={() => { setPersonaCreateOpen(false); setNewPersonaName(""); setNewPersonaPrompt(""); }}
-                                className="px-2 py-0.5 text-[11px] text-gray-500 hover:underline"
-                              >Cancel</button>
-                              <button
-                                type="button"
-                                onClick={handleCreatePersonaInline}
-                                disabled={creatingPersona || !newPersonaName.trim() || !newPersonaPrompt.trim()}
-                                className="flex-1 py-1 rounded text-[11px] font-medium bg-blue-500 text-white disabled:opacity-50"
-                              >
-                                {creatingPersona ? "Saving…" : "Save & use"}
-                              </button>
-                            </div>
-                          </div>
-                        ) : (
-                          <select
-                            value={agentForm.personaId}
-                            onChange={(e) => setAgentForm((f) => ({ ...f, personaId: e.target.value }))}
-                            className="w-full h-8 border border-input rounded-md px-2 text-xs bg-background"
+                          <button
+                            type="button"
+                            onClick={() => setPersonaPopupOpen(true)}
+                            className="text-[11px] text-blue-600 hover:underline"
                           >
-                            {personas.map((p) => (
-                              <option key={p.id} value={p.id}>
-                                {p.name}{p.owner_id === null ? " (default)" : ""}
-                              </option>
-                            ))}
-                          </select>
-                        )}
+                            + New persona
+                          </button>
+                        </div>
+                        <select
+                          value={agentForm.personaId}
+                          onChange={(e) => setAgentForm((f) => ({ ...f, personaId: e.target.value }))}
+                          className="w-full h-8 border border-input rounded-md px-2 text-xs bg-background"
+                        >
+                          {personas.map((p) => (
+                            <option key={p.id} value={p.id}>
+                              {p.name}{p.owner_id === null ? " (default)" : ""}
+                            </option>
+                          ))}
+                        </select>
                       </div>
 
                       <Button
@@ -1308,6 +1256,12 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
 
           </SheetContent>
         </Sheet>
+
+        <PersonaPopup
+          open={personaPopupOpen}
+          onClose={() => setPersonaPopupOpen(false)}
+          onSaved={(p) => setAgentForm((f) => ({ ...f, personaId: p.id }))}
+        />
       </div>
     </Ctx.Provider>
   );

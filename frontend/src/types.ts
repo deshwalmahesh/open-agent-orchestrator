@@ -75,7 +75,6 @@ export interface Chat {
   id: string;
   agent_id: string;
   agent_name?: string | null;
-  persona_id?: string | null;
   channel: "web" | "slack";
   external_thread_id?: string | null;
   title?: string | null;

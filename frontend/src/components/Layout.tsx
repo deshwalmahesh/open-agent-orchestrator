@@ -10,13 +10,15 @@ export default function Layout() {
   return (
     <div className="flex h-screen bg-background">
       <aside className="w-56 border-r flex flex-col p-4 shrink-0">
-        <div className="font-semibold text-base mb-1">Agent Platform</div>
+        <div className="font-semibold text-sm mb-0.5 leading-tight">Multi Agent</div>
+        <div className="font-semibold text-sm mb-1 leading-tight">Orchestrator</div>
         <div className="text-xs text-muted-foreground mb-4">Orchestration UI</div>
         <Separator className="mb-4" />
         <nav className="flex-1 space-y-1">
           {[
             { to: "/agents", label: "Pipelines" },
             { to: "/chats", label: "Chats" },
+            { to: "/personas", label: "Personas" },
             { to: "/skills", label: "Skills" },
           ].map(({ to, label }) => (
             <NavLink

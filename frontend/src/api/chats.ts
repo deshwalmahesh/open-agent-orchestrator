@@ -7,7 +7,7 @@ export async function listChats(token: string): Promise<Chat[]> {
 
 export async function createChat(
   token: string,
-  data: { agent_id: string; persona_id?: string; title?: string },
+  data: { agent_id: string; title?: string },
 ): Promise<Chat> {
   return apiFetch("/chats", { method: "POST", body: JSON.stringify({ channel: "web", ...data }) }, token);
 }
@@ -15,7 +15,7 @@ export async function createChat(
 export async function patchChat(
   token: string,
   id: string,
-  data: { agent_id?: string; persona_id?: string | null },
+  data: { agent_id?: string },
 ): Promise<Chat> {
   return apiFetch(`/chats/${id}`, { method: "PATCH", body: JSON.stringify(data) }, token);
 }

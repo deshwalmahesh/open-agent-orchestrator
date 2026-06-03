@@ -8,10 +8,14 @@ export interface LLMDefaults {
   max_tokens: number;
 }
 
+// No factory provider/model defaults: pre-filling values the user never saved
+// is misleading (e.g. "gpt-4o-mini" implies they have an OpenAI key). Only
+// numeric tunables get sensible defaults — base_url/model/api_key stay empty
+// until the user picks a provider preset or types their own.
 const FACTORY: LLMDefaults = {
-  base_url: "https://api.openai.com/v1",
-  api_key: "EMPTY",
-  model: "gpt-4o-mini",
+  base_url: "",
+  api_key: "",
+  model: "",
   temperature: 0.7,
   max_tokens: 1024,
 };

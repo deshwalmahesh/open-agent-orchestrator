@@ -245,7 +245,6 @@ async def create_chat(
     *,
     user_id: UUID,
     agent_id: UUID,
-    persona_id: UUID | None = None,
     channel: str = "web",
     external_thread_id: str | None = None,
     title: str | None = None,
@@ -253,7 +252,6 @@ async def create_chat(
     row = ChatDB(
         user_id=user_id,
         agent_id=agent_id,
-        persona_id=persona_id,
         channel=channel,
         external_thread_id=external_thread_id,
         title=title,
@@ -280,16 +278,13 @@ async def update_chat(
     chat_id: UUID,
     user_id: UUID,
     agent_id: UUID | None = None,
-    persona_id: UUID | None = None,
 ) -> ChatDB | None:
-    """Reassign agent or persona. Only non-None fields are updated."""
+    """Reassign the chat's agent. Only non-None fields are updated."""
     row = await get_chat(session, chat_id=chat_id, user_id=user_id)
     if row is None:
         return None
     if agent_id is not None:
         row.agent_id = agent_id
-    if persona_id is not None:
-        row.persona_id = persona_id
     await session.commit()
     await session.refresh(row)
     return row

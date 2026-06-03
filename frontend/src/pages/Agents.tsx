@@ -8,17 +8,20 @@ import { Dialog, DialogContent } from "@/components/ui/dialog";
 import AgentForm from "@/components/AgentForm";
 import { listAgents, createAgent, updateAgent, deleteAgent } from "@/api/agents";
 import { getSlackStatus, setSlackActive } from "@/api/slack";
+import { listPersonas } from "@/api/personas";
 import { useAuth } from "@/hooks/useAuth";
 import { getLLMDefaults } from "@/lib/llm-defaults";
 import type { Agent, AgentConfig } from "@/types";
 
-function buildDefaultConfig(name: string): AgentConfig {
+const DEFAULT_SUPERVISOR_FALLBACK = "You are a helpful assistant.";
+
+function buildDefaultConfig(name: string, supervisorPrompt: string): AgentConfig {
   const llm = getLLMDefaults();
   return {
     name,
-    role: "assistant",
+    role: "supervisor",
     description: null,
-    system_prompt: "You are a helpful assistant.",
+    system_prompt: supervisorPrompt,
     llm: { base_url: llm.base_url, api_key: llm.api_key, model: llm.model, temperature: llm.temperature, max_tokens: llm.max_tokens, timeout_s: 30.0 },
     tools: [],
     memory: { type: "summary", window: 10, summary_threshold: 20 },
@@ -54,6 +57,13 @@ export default function Agents() {
   });
   const slackActiveId = slackStatus?.active_agent_id ?? null;
 
+  const { data: personas = [] } = useQuery({
+    queryKey: ["personas"],
+    queryFn: () => listPersonas(token!),
+    enabled: !!token,
+    staleTime: 60_000,
+  });
+
   // Pipelines page shows only root pipelines, not sub-agents.
   // Sub-agents are edited inside the canvas (right-click → properties).
   const pipelines = agents.filter((a) => isPipelineRoot(a, agents));
@@ -75,8 +85,11 @@ export default function Agents() {
     if (creating) return;
     setCreating(true);
     const autoName = pipelines.length === 0 ? "My Pipeline" : `Pipeline ${pipelines.length + 1}`;
+    const supervisorPrompt =
+      personas.find((p) => p.name === "Default - Supervisor")?.system_prompt
+      ?? DEFAULT_SUPERVISOR_FALLBACK;
     try {
-      const agent = await createAgent(token!, buildDefaultConfig(autoName));
+      const agent = await createAgent(token!, buildDefaultConfig(autoName, supervisorPrompt));
       await qc.invalidateQueries({ queryKey: ["agents"] });
       navigate(`/agents/${agent.id}/canvas`);
     } catch (err) {

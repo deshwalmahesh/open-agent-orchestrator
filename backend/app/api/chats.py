@@ -1,5 +1,5 @@
 """Chat CRUD + PATCH (agent reassignment). Validates cross-references:
-agent_id and persona_id (if set) must belong to the requesting user."""
+agent_id (if set) must belong to the requesting user."""
 from __future__ import annotations
 
 from typing import Annotated, Literal
@@ -19,7 +19,6 @@ from app.db.repos import (
     delete_chat,
     get_agent,
     get_chat,
-    get_persona,
     list_chats,
     list_messages,
     update_chat,
@@ -34,7 +33,6 @@ router = APIRouter(prefix="/chats", tags=["chats"])
 
 class ChatCreateBody(BaseModel):
     agent_id: UUID
-    persona_id: UUID | None = None
     channel: Literal["web", "slack"] = "web"
     external_thread_id: str | None = None
     title: str | None = None
@@ -53,7 +51,6 @@ class MessageBody(BaseModel):
 
 class ChatPatchBody(BaseModel):
     agent_id: UUID | None = None
-    persona_id: UUID | None = None
 
 
 def _to_response(row, agent_name: str | None = None) -> dict:
@@ -61,7 +58,6 @@ def _to_response(row, agent_name: str | None = None) -> dict:
         "id": str(row.id),
         "agent_id": str(row.agent_id) if row.agent_id else None,
         "agent_name": agent_name,
-        "persona_id": str(row.persona_id) if row.persona_id else None,
         "channel": row.channel,
         "external_thread_id": row.external_thread_id,
         "title": row.title,
@@ -76,18 +72,14 @@ async def create(
     user: Annotated[UserDB, Depends(current_active_user)],
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> dict:
-    # Cross-ref ownership checks: prevent users from attaching others' resources.
+    # Cross-ref ownership check: prevent attaching another user's agent.
     if await get_agent(session, agent_id=body.agent_id, user_id=user.id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
-    if body.persona_id is not None:
-        if await get_persona(session, persona_id=body.persona_id, user_id=user.id) is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "persona not found")
 
     row = await create_chat(
         session,
         user_id=user.id,
         agent_id=body.agent_id,
-        persona_id=body.persona_id,
         channel=body.channel,
         external_thread_id=body.external_thread_id,
         title=body.title,
@@ -134,19 +126,12 @@ async def patch(
     user: Annotated[UserDB, Depends(current_active_user)],
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> dict:
-    """Reassign agent or persona on an existing chat."""
+    """Reassign the chat's agent (= pipeline)."""
     if body.agent_id is not None:
         if await get_agent(session, agent_id=body.agent_id, user_id=user.id) is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
-    if body.persona_id is not None:
-        if await get_persona(session, persona_id=body.persona_id, user_id=user.id) is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "persona not found")
     row = await update_chat(
-        session,
-        chat_id=chat_id,
-        user_id=user.id,
-        agent_id=body.agent_id,
-        persona_id=body.persona_id,
+        session, chat_id=chat_id, user_id=user.id, agent_id=body.agent_id,
     )
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "chat not found")

@@ -27,4 +27,9 @@ def word_count(text: str) -> int:
 
 
 if __name__ == "__main__":
+    print(
+        "[sample-mcp] listening on 0.0.0.0:8001 — when registering in the UI from\n"
+        "[sample-mcp] another container, use http://mcp-sample:8001/mcp (NOT 0.0.0.0/localhost).",
+        flush=True,
+    )
     mcp.run(transport="http", host="0.0.0.0", port=8001)

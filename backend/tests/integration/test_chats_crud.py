@@ -7,7 +7,24 @@ from uuid import uuid4
 def _create_agent(client, token: str, auth_header, sample_agent_config, name: str = "Researcher") -> str:
     r = client.post("/agents", json=sample_agent_config(name), headers=auth_header(token))
     assert r.status_code == 201, r.text
-    return r.json()["id"]
+    agent_id = r.json()["id"]
+    # Agents start as Draft and must be deployed before they can be used in
+    # chats. These tests exercise post-deploy state; a separate test covers the
+    # Draft-rejection path.
+    d = client.post(f"/agents/{agent_id}/deploy", headers=auth_header(token))
+    assert d.status_code == 200, d.text
+    return agent_id
+
+
+def test_create_chat_rejects_draft_pipeline(client, signup_and_login, auth_header, sample_agent_config):
+    token = signup_and_login()
+    r = client.post("/agents", json=sample_agent_config("Drafty"), headers=auth_header(token))
+    assert r.status_code == 201
+    agent_id = r.json()["id"]
+    # Skip deploy on purpose — agent is Draft.
+    r = client.post("/chats", json={"agent_id": agent_id}, headers=auth_header(token))
+    assert r.status_code == 400
+    assert "draft" in r.json()["detail"].lower()
 
 
 def test_create_chat_with_agent_only(client, signup_and_login, auth_header, sample_agent_config):

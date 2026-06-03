@@ -11,6 +11,8 @@ export default defineConfig({
     },
   },
   server: {
+    // Polling: macOS/Windows Docker bind mounts don't deliver inotify events.
+    watch: { usePolling: true, interval: 300 },
     proxy: {
       "/api": {
         // API_BACKEND_URL: Docker-internal name (backend:8000) or localhost for plain dev.

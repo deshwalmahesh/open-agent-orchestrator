@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_async_session
 from app.db.models import AgentDB, UserDB
 from app.db.repos import create_agent, delete_agent, get_agent, list_agents, update_agent
-from app.domain import AgentConfig
+from app.domain import AgentConfig, utcnow
 from app.runtime.agent import MAX_AGENT_DEPTH
 from app.runtime.tools import REGISTRY
 from app.users import current_active_user
@@ -87,11 +87,12 @@ async def _validate_subagent_tree(
 
 
 def _to_response(row) -> dict:
-    """DB row → API shape. We echo the stored AgentConfig + DB metadata."""
+    """DB row → API shape. `deployed_at` is None for Draft pipelines."""
     return {
         "id": str(row.id),
         "name": row.name,
         "config": row.config,
+        "deployed_at": row.deployed_at.isoformat() if row.deployed_at else None,
         "created_at": row.created_at.isoformat(),
         "updated_at": row.updated_at.isoformat(),
     }
@@ -160,3 +161,29 @@ async def delete(
     if not await delete_agent(session, agent_id=agent_id, user_id=user.id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     log.info("agent.deleted", agent_id=str(agent_id), user_id=str(user.id))
+
+
+@router.post("/{agent_id}/deploy")
+async def deploy(
+    agent_id: UUID,
+    user: Annotated[UserDB, Depends(current_active_user)],
+    session: Annotated[AsyncSession, Depends(get_async_session)],
+) -> dict:
+    """Validate the saved config and mark the pipeline Deployed.
+    Once deployed, edits do NOT auto-revert to Draft (explicit user choice)."""
+    row = await get_agent(session, agent_id=agent_id, user_id=user.id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+
+    cfg = AgentConfig.model_validate(row.config)
+    if not cfg.llm.model.strip():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "llm.model is required to deploy")
+    if not cfg.system_prompt.strip():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "system_prompt is required to deploy")
+    await _validate_subagent_tree(cfg, user.id, session, self_id=agent_id)
+
+    row.deployed_at = utcnow()
+    await session.commit()
+    await session.refresh(row)
+    log.info("agent.deployed", agent_id=str(agent_id), user_id=str(user.id))
+    return _to_response(row)

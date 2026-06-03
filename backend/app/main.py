@@ -15,6 +15,7 @@ from app.api.chats import router as chats_router
 from app.api.health import router as health_router
 from app.api.mcp_servers import router as mcp_router
 from app.api.personas import router as personas_router
+from app.api.providers import router as providers_router
 from app.api.runs import router as runs_router
 from app.api.skills import router as skills_router
 from app.api.slack import router as slack_router
@@ -146,6 +147,7 @@ def create_app() -> FastAPI:
     app.include_router(agents_router)
     app.include_router(slack_router)
     app.include_router(personas_router)
+    app.include_router(providers_router)
     app.include_router(skills_router)
     app.include_router(mcp_router)
     app.include_router(tool_configs_router)

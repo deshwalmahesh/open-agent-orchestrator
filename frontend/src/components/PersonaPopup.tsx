@@ -92,8 +92,10 @@ export default function PersonaPopup({ open, initial, onClose, onSaved, onDelete
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && !busy && onClose()}>
-      <DialogContent className="max-w-3xl p-0 overflow-hidden">
-        <div className="px-6 pt-5 pb-4 border-b">
+      <DialogContent
+        className="max-w-5xl w-[92vw] max-h-[92vh] p-0 overflow-hidden flex flex-col"
+      >
+        <div className="px-6 pt-5 pb-4 border-b shrink-0">
           <p className="font-semibold text-base text-gray-900">{headerLabel}</p>
           <p className="text-xs text-muted-foreground mt-0.5">
             {isCopyOfGlobal
@@ -102,7 +104,7 @@ export default function PersonaPopup({ open, initial, onClose, onSaved, onDelete
           </p>
         </div>
 
-        <div className="px-6 py-5 space-y-4">
+        <div className="px-6 py-5 space-y-4 overflow-y-auto flex-1 min-h-0">
           <div className="space-y-1.5">
             <Label className="text-xs font-semibold text-gray-700">Name</Label>
             <Input
@@ -120,8 +122,7 @@ export default function PersonaPopup({ open, initial, onClose, onSaved, onDelete
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
               placeholder="You are…"
-              rows={22}
-              className="text-sm font-mono leading-relaxed resize-y focus-visible:ring-violet-300 min-h-[24rem]"
+              className="text-sm font-mono leading-relaxed resize-y focus-visible:ring-violet-300 min-h-[28rem] h-[55vh]"
             />
           </div>
 
@@ -130,32 +131,32 @@ export default function PersonaPopup({ open, initial, onClose, onSaved, onDelete
               {error}
             </p>
           )}
+        </div>
 
-          <div className="flex gap-2 pt-1">
-            {isEdit && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={confirmDelete}
-                disabled={busy}
-                className="text-destructive hover:text-destructive hover:bg-red-50"
-              >
-                {deleteMut.isPending ? "Deleting…" : "Delete"}
-              </Button>
-            )}
-            <div className="flex-1" />
-            <Button variant="outline" size="sm" onClick={onClose} disabled={busy}>
-              Cancel
-            </Button>
+        <div className="px-6 py-3 border-t flex gap-2 shrink-0 bg-white">
+          {isEdit && (
             <Button
+              variant="ghost"
               size="sm"
-              disabled={!canSave}
-              onClick={() => saveMut.mutate()}
-              className="bg-violet-600 hover:bg-violet-700 text-white"
+              onClick={confirmDelete}
+              disabled={busy}
+              className="text-destructive hover:text-destructive hover:bg-red-50"
             >
-              {saveLabel}
+              {deleteMut.isPending ? "Deleting…" : "Delete"}
             </Button>
-          </div>
+          )}
+          <div className="flex-1" />
+          <Button variant="outline" size="sm" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button
+            size="sm"
+            disabled={!canSave}
+            onClick={() => saveMut.mutate()}
+            className="bg-violet-600 hover:bg-violet-700 text-white"
+          >
+            {saveLabel}
+          </Button>
         </div>
       </DialogContent>
     </Dialog>

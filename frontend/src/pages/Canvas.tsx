@@ -6,7 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 import AgentCanvas from "@/components/AgentCanvas";
-import { getAgent, listAgents, updateAgent } from "@/api/agents";
+import { getAgent, listAgents, updateAgent, deployAgent } from "@/api/agents";
 import { getSlackStatus, connectSlack, disconnectSlack } from "@/api/slack";
 import { useAuth } from "@/hooks/useAuth";
 
@@ -46,17 +46,23 @@ export default function Canvas() {
 
   const slackConnected = slackStatus?.connected ?? false;
 
+  // Save persists config. Deploy = save + flip Draft → Deployed (one-time;
+  // edits after deploy stay Deployed). Once deployed, the same button just
+  // saves — relabelled to make that explicit.
   async function handleDeploy() {
     if (!agent || !token) return;
     setSaveState("saving");
     try {
       await updateAgent(token, agent.id, agent.config);
+      if (!agent.deployed_at) {
+        await deployAgent(token, agent.id);
+      }
       await qc.invalidateQueries({ queryKey: ["agents"] });
       await qc.invalidateQueries({ queryKey: ["agent", agent.id] });
       setSaveState("saved");
       setTimeout(() => setSaveState("idle"), 3000);
-    } catch (e) {
-      console.error("Deploy failed:", e);
+    } catch (e: unknown) {
+      console.error("Deploy/save failed:", e);
       setSaveState("error");
       setTimeout(() => setSaveState("idle"), 3000);
     }
@@ -93,7 +99,7 @@ export default function Canvas() {
   }
 
   if (loadingAgent) return <div className="p-6 text-muted-foreground">Loading canvas…</div>;
-  if (error || !agent) return <div className="p-6 text-destructive">Agent not found.</div>;
+  if (error || !agent) return <div className="p-6 text-destructive">Pipeline not found.</div>;
 
   return (
     <div className="flex flex-col h-full">
@@ -103,6 +109,11 @@ export default function Canvas() {
           ← Pipelines
         </Link>
         <span className="font-semibold text-sm">{agent.name}</span>
+        {!agent.deployed_at && (
+          <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-300">
+            Draft
+          </span>
+        )}
         <span className="text-muted-foreground text-xs hidden sm:inline">Pipeline Canvas</span>
 
         <div className="ml-auto flex items-center gap-2">
@@ -110,7 +121,7 @@ export default function Canvas() {
           <span className="text-xs text-muted-foreground hidden md:inline">
             {agent.config.tools.length} tools
             {agent.config.mcp_servers.length > 0 && ` · ${agent.config.mcp_servers.length} MCP`}
-            {agent.config.subagents.length > 0 && ` · ${agent.config.subagents.length} agents`}
+            {agent.config.subagents.length > 0 && ` · ${agent.config.subagents.length} sub-agents`}
           </span>
 
           {/* Slack button — visible once agent exists */}
@@ -134,21 +145,26 @@ export default function Canvas() {
             </Button>
           )}
 
-          {/* Deploy */}
+          {/* Deploy (Draft) / Save (Deployed) — same button, role depends on state */}
           {saveState === "saved" && (
             <span className="text-xs text-emerald-600 font-medium flex items-center gap-1">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block" />
-              Deployed
+              {agent.deployed_at ? "Saved" : "Deployed"}
             </span>
           )}
-          {saveState === "error" && <span className="text-xs text-red-500 font-medium">Deploy failed</span>}
+          {saveState === "error" && <span className="text-xs text-red-500 font-medium">Failed</span>}
           <Button
             size="sm"
             onClick={handleDeploy}
             disabled={saveState === "saving"}
-            className="bg-violet-600 hover:bg-violet-700 text-white text-xs"
+            className={cn(
+              "text-white text-xs",
+              agent.deployed_at ? "bg-violet-600 hover:bg-violet-700" : "bg-amber-500 hover:bg-amber-600",
+            )}
           >
-            {saveState === "saving" ? "Deploying…" : "Deploy"}
+            {saveState === "saving"
+              ? (agent.deployed_at ? "Saving…" : "Deploying…")
+              : (agent.deployed_at ? "Save" : "Deploy")}
           </Button>
         </div>
       </div>

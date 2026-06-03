@@ -10,6 +10,7 @@ import Canvas from "@/pages/Canvas";
 import Chat from "@/pages/Chat";
 import Skills from "@/pages/Skills";
 import Personas from "@/pages/Personas";
+import Integrations from "@/pages/Integrations";
 import "@/index.css";
 
 const queryClient = new QueryClient({
@@ -37,6 +38,7 @@ createRoot(document.getElementById("root")!).render(
                 <Route path="/chats/:id" element={<Chat />} />
                 <Route path="/personas" element={<Personas />} />
                 <Route path="/skills" element={<Skills />} />
+                <Route path="/integrations" element={<Integrations />} />
                 <Route path="/" element={<Navigate to="/agents" replace />} />
               </Route>
             </Route>

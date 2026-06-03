@@ -20,6 +20,7 @@ export default function Layout() {
             { to: "/chats", label: "Chats" },
             { to: "/personas", label: "Personas" },
             { to: "/skills", label: "Skills" },
+            { to: "/integrations", label: "Integrations" },
           ].map(({ to, label }) => (
             <NavLink
               key={to}

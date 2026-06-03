@@ -54,6 +54,8 @@ export interface Agent {
   id: string;
   name: string;
   config: AgentConfig;
+  // ISO timestamp when the pipeline was deployed; null = Draft (cannot be used in chats/Slack).
+  deployed_at?: string | null;
   created_at: string;
   updated_at: string;
 }

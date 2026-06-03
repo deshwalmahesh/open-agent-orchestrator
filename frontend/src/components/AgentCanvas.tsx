@@ -18,9 +18,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import AgentForm from "@/components/AgentForm";
-import { updateAgent, createAgent as apiCreateAgent } from "@/api/agents";
+import { updateAgent, createAgent as apiCreateAgent, deleteAgent as apiDeleteAgent } from "@/api/agents";
 import { listTools } from "@/api/tools";
-import { listMCPServers, discoverMCPTools, createMCPServer } from "@/api/mcp-servers";
+import { listMCPServers, discoverMCPTools, createMCPServer, deleteMCPServer } from "@/api/mcp-servers";
 import { listToolConfigs, upsertToolConfig, validateToolConfig } from "@/api/tool-configs";
 import { listPersonas } from "@/api/personas";
 import PersonaPopup from "@/components/PersonaPopup";
@@ -168,7 +168,7 @@ function MainNode({ id, data, selected }: NodeProps) {
       <button
         onClick={(e) => { e.stopPropagation(); onAdd(id, true); }}
         className="nodrag nopan absolute -bottom-4 left-1/2 -translate-x-1/2 size-9 rounded-full bg-violet-600 hover:bg-violet-700 text-white text-lg font-medium flex items-center justify-center shadow-lg shadow-violet-300/60 transition-all opacity-0 group-hover:opacity-100 scale-90 group-hover:scale-100"
-        title="Connect tool, MCP, or agent"
+        title="Connect tool, MCP, or sub-agent"
       >+</button>
       <H type="source" pos={Position.Bottom} />
     </div>
@@ -193,7 +193,7 @@ function SubAgentNode({ id, data, selected }: NodeProps) {
     >
       <div className="absolute inset-y-0 left-0 w-1 rounded-l-xl bg-violet-300" />
       <div className="pl-4 pr-3 py-3">
-        <p className="text-[9px] font-bold uppercase tracking-[0.18em] text-violet-400 mb-1">Sub agent</p>
+        <p className="text-[9px] font-bold uppercase tracking-[0.18em] text-violet-400 mb-1">Sub-Agent</p>
         <p className="font-medium text-sm text-zinc-800 truncate leading-tight">{data.label as string}</p>
         {(data.role as string) && (
           <p className="text-[10px] text-zinc-400 truncate mt-0.5">{data.role as string}</p>
@@ -210,7 +210,7 @@ function SubAgentNode({ id, data, selected }: NodeProps) {
       <button
         onClick={(e) => { e.stopPropagation(); onAdd(id, false); }}
         className="nodrag nopan absolute -bottom-3.5 left-1/2 -translate-x-1/2 size-7 rounded-full bg-violet-400 hover:bg-violet-500 text-white text-base font-medium flex items-center justify-center shadow-md transition-all opacity-0 group-hover:opacity-100 scale-90 group-hover:scale-100"
-        title="Add tool to this agent"
+        title="Add tool"
       >+</button>
       <H type="target" pos={Position.Top} />
       <H type="source" pos={Position.Bottom} />
@@ -451,6 +451,22 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
     }
   }, [agent, token, qc]);
 
+  // Delete the sub-agent ENTIRELY from the account (not just detach). Detaches
+  // from this pipeline first if attached, then deletes the AgentDB row. Other
+  // pipelines that referenced it will get a stale reference until they edit.
+  const deleteSubagentRegistration = useCallback(async (subId: string, subName: string) => {
+    if (!confirm(`Delete sub-agent "${subName}" from your account?\nOther pipelines using it will lose the reference.`)) return;
+    if (agent.config.subagents.includes(subId)) {
+      await removeSubagent(subId);
+    }
+    try {
+      await apiDeleteAgent(token!, subId);
+      await qc.invalidateQueries({ queryKey: ["agents"] });
+    } catch (e) {
+      console.error("Failed to delete sub-agent:", e);
+    }
+  }, [agent, token, qc, removeSubagent]);
+
   const addMCPServer = useCallback(async (serverId: string) => {
     if (agent.config.mcp_servers.includes(serverId)) return;
     const updated: AgentConfig = { ...agent.config, mcp_servers: [...agent.config.mcp_servers, serverId] };
@@ -474,6 +490,21 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
       await qc.invalidateQueries({ queryKey: ["agents"] });
     }
   }, [agent, token, qc]);
+
+  // Delete the MCP server REGISTRATION (not just detach). Detaches from this
+  // pipeline first if attached, then deletes the user's MCP-server row.
+  const deleteMCPRegistration = useCallback(async (serverId: string, serverName: string) => {
+    if (!confirm(`Delete MCP server "${serverName}"? This unregisters it from your account.`)) return;
+    if (agent.config.mcp_servers.includes(serverId)) {
+      await removeMCPServer(serverId);
+    }
+    try {
+      await deleteMCPServer(token!, serverId);
+      await qc.invalidateQueries({ queryKey: ["mcp-servers"] });
+    } catch (e) {
+      console.error("Failed to delete MCP server:", e);
+    }
+  }, [agent, token, qc, removeMCPServer]);
 
   // ── Context ───────────────────────────────────────────────────────────────
   const onAdd = useCallback((sourceAgentId: string, isRoot: boolean) => {
@@ -742,7 +773,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
         {isEmpty && (
           <div className="absolute inset-0 flex items-end justify-center pb-16 pointer-events-none">
             <div className="bg-white/80 backdrop-blur-sm border border-violet-100 rounded-2xl px-6 py-4 text-center shadow-sm">
-              <p className="text-sm text-violet-600 font-medium">Hover the agent node and click <span className="bg-violet-100 rounded px-1 font-bold">+</span> to connect tools, sub-agents, or MCP servers</p>
+              <p className="text-sm text-violet-600 font-medium">Hover any node and click <span className="bg-violet-100 rounded px-1 font-bold">+</span> to connect tools, sub-agents, or MCP servers</p>
               <p className="text-xs text-muted-foreground mt-1">Double-click or right-click any node to edit its properties</p>
             </div>
           </div>
@@ -752,7 +783,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
         <div className="absolute top-3 right-3 bg-white/95 border border-zinc-200 rounded-lg px-3 py-2.5 text-[11px] shadow-sm backdrop-blur-sm space-y-1.5">
           <p className="font-bold text-[9px] uppercase tracking-[0.18em] text-zinc-400 mb-1.5">Legend</p>
           <div className="flex items-center gap-2 text-zinc-700"><span className="w-1.5 h-1.5 rounded-full bg-violet-600" />Supervisor</div>
-          <div className="flex items-center gap-2 text-zinc-700"><span className="w-1.5 h-1.5 rounded-full bg-violet-300" />Sub agent</div>
+          <div className="flex items-center gap-2 text-zinc-700"><span className="w-1.5 h-1.5 rounded-full bg-violet-300" />Sub-Agent</div>
           <div className="flex items-center gap-2 text-zinc-700"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />Tool</div>
           <div className="flex items-center gap-2 text-zinc-700"><span className="w-1.5 h-1.5 rounded-full bg-amber-500" />MCP</div>
           <p className="text-zinc-400 text-[10px] pt-1 border-t border-zinc-100">Hover → + · Dbl-click → edit</p>
@@ -763,7 +794,7 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
           <div className="absolute left-0 top-0 bottom-0 z-20 w-[300px] bg-white/95 backdrop-blur-md border-r border-gray-200 shadow-xl flex flex-col">
             {/* Panel header */}
             <div className="flex items-center gap-2 px-4 py-3 border-b bg-gradient-to-r from-violet-50 to-blue-50 shrink-0">
-              <p className="font-semibold text-sm flex-1">Connect to Agent</p>
+              <p className="font-semibold text-sm flex-1">Add Connection</p>
               <button
                 onClick={() => { setAddPanel(null); setAgentCreateOpen(false); setMcpRegOpen(false); }}
                 className="size-6 rounded-full hover:bg-gray-200 flex items-center justify-center text-gray-400 hover:text-gray-700 transition-colors"
@@ -782,11 +813,11 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                     <button
                       onClick={() => setAgentCreateOpen(true)}
                       className="w-full mb-2 p-2.5 rounded-xl border-2 border-dashed border-blue-200 hover:border-blue-400 hover:bg-blue-50/50 text-blue-600 text-xs font-semibold transition-all"
-                    >+ Create New Agent</button>
+                    >+ Create New Sub-Agent</button>
                   ) : (
                     <div className="mb-3 p-3 rounded-xl border border-blue-200 bg-blue-50/30 space-y-2.5">
                       <div className="flex items-center justify-between mb-1">
-                        <span className="text-xs font-bold text-blue-700">New Agent</span>
+                        <span className="text-xs font-bold text-blue-700">New Sub-Agent</span>
                         <button onClick={() => setAgentCreateOpen(false)} className="text-xs text-gray-400 hover:text-gray-600">✕</button>
                       </div>
 
@@ -893,25 +924,38 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                   {panelAgents.map((a) => {
                     const attached = agent.config.subagents.includes(a.id);
                     return (
-                      <button
+                      <div
                         key={a.id}
-                        onClick={() => !attached && addSubagent(a.id)}
-                        disabled={attached}
                         className={cn(
-                          "w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl border text-left transition-all mb-1.5",
+                          "w-full flex items-center gap-2 px-3 py-2.5 rounded-xl border mb-1.5 transition-colors",
                           attached
-                            ? "border-blue-100 bg-blue-50/40 opacity-60 cursor-default"
-                            : "border-gray-100 hover:border-blue-200 hover:bg-blue-50/40 cursor-pointer",
+                            ? "border-blue-200 bg-blue-50/40"
+                            : "border-gray-100 hover:border-blue-200 hover:bg-blue-50/40",
                         )}
                       >
                         <div className="flex-1 min-w-0">
                           <p className="text-xs font-semibold text-gray-900 truncate">{a.name}</p>
                           <p className="text-[10px] text-gray-400 truncate">{a.config.role}</p>
                         </div>
-                        {attached
-                          ? <span className="text-[10px] bg-blue-100 text-blue-600 rounded-full px-2 py-0.5 font-medium shrink-0">Attached</span>
-                          : <span className="text-gray-300 text-sm shrink-0">→</span>}
-                      </button>
+                        {attached ? (
+                          <button
+                            onClick={() => removeSubagent(a.id)}
+                            title="Detach from this pipeline — sub-agent stays in your account"
+                            className="text-[10px] bg-blue-100 hover:bg-blue-500 hover:text-white text-blue-700 rounded-full px-2 py-0.5 font-medium shrink-0 transition-colors"
+                          >Detach</button>
+                        ) : (
+                          <button
+                            onClick={() => addSubagent(a.id)}
+                            title="Attach to this pipeline"
+                            className="text-[10px] bg-emerald-100 hover:bg-emerald-500 hover:text-white text-emerald-700 rounded-full px-2 py-0.5 font-medium shrink-0 transition-colors"
+                          >Attach</button>
+                        )}
+                        <button
+                          onClick={() => deleteSubagentRegistration(a.id, a.name)}
+                          title="Delete sub-agent — removes it from your account entirely"
+                          className="size-5 rounded text-red-400 hover:text-white hover:bg-red-500 flex items-center justify-center text-sm font-bold shrink-0 transition-colors"
+                        >×</button>
+                      </div>
                     );
                   })}
                 </section>
@@ -1037,14 +1081,24 @@ export default function AgentCanvas({ agent, allAgents }: Props) {
                           <p className="text-xs font-semibold text-gray-900 truncate">{server.name}</p>
                           <p className="text-[10px] text-gray-400 truncate font-mono">{server.url}</p>
                         </div>
-                        {attached
-                          ? <span className="text-[10px] bg-amber-100 text-amber-600 rounded-full px-2 py-0.5 font-medium shrink-0">Attached</span>
-                          : (
-                            <button
-                              onClick={() => addMCPServer(server.id)}
-                              className="text-[10px] bg-amber-500 hover:bg-amber-600 text-white rounded-full px-2 py-0.5 font-medium shrink-0 transition-colors"
-                            >Attach →</button>
-                          )}
+                        {attached ? (
+                          <button
+                            onClick={() => removeMCPServer(server.id)}
+                            title="Detach from this pipeline — server stays registered in your account"
+                            className="text-[10px] bg-amber-100 hover:bg-amber-500 hover:text-white text-amber-700 rounded-full px-2 py-0.5 font-medium shrink-0 transition-colors"
+                          >Detach</button>
+                        ) : (
+                          <button
+                            onClick={() => addMCPServer(server.id)}
+                            title="Attach to this pipeline"
+                            className="text-[10px] bg-emerald-100 hover:bg-emerald-500 hover:text-white text-emerald-700 rounded-full px-2 py-0.5 font-medium shrink-0 transition-colors"
+                          >Attach</button>
+                        )}
+                        <button
+                          onClick={() => deleteMCPRegistration(server.id, server.name)}
+                          title="Delete registration — removes the server from your account entirely"
+                          className="size-5 rounded text-red-400 hover:text-white hover:bg-red-500 flex items-center justify-center text-sm font-bold shrink-0 transition-colors"
+                        >×</button>
                       </div>
                       {/* Discovered tools */}
                       {discovered.length > 0 && (

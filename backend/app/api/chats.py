@@ -74,8 +74,11 @@ async def create(
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> dict:
     # Cross-ref ownership check: prevent attaching another user's agent.
-    if await get_agent(session, agent_id=body.agent_id, user_id=user.id) is None:
+    agent_row = await get_agent(session, agent_id=body.agent_id, user_id=user.id)
+    if agent_row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    if agent_row.deployed_at is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "pipeline is in Draft — deploy it before starting a chat")
 
     row = await create_chat(
         session,
@@ -158,8 +161,11 @@ async def patch(
 ) -> dict:
     """Reassign the chat's agent (= pipeline)."""
     if body.agent_id is not None:
-        if await get_agent(session, agent_id=body.agent_id, user_id=user.id) is None:
+        agent_row = await get_agent(session, agent_id=body.agent_id, user_id=user.id)
+        if agent_row is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+        if agent_row.deployed_at is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "pipeline is in Draft — deploy it before reassigning")
     row = await update_chat(
         session, chat_id=chat_id, user_id=user.id, agent_id=body.agent_id,
     )

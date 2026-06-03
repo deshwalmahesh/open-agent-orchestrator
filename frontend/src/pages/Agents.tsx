@@ -4,14 +4,12 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn, isPipelineRoot } from "@/lib/utils";
-import { Dialog, DialogContent } from "@/components/ui/dialog";
-import AgentForm from "@/components/AgentForm";
-import { listAgents, createAgent, updateAgent, deleteAgent } from "@/api/agents";
+import { listAgents, createAgent, deleteAgent, deployAgent } from "@/api/agents";
 import { getSlackStatus, setSlackActive } from "@/api/slack";
 import { listPersonas } from "@/api/personas";
 import { useAuth } from "@/hooks/useAuth";
 import { getLLMDefaults } from "@/lib/llm-defaults";
-import type { Agent, AgentConfig } from "@/types";
+import type { AgentConfig } from "@/types";
 
 const DEFAULT_SUPERVISOR_FALLBACK = "You are a helpful assistant.";
 
@@ -40,8 +38,6 @@ export default function Agents() {
   const navigate = useNavigate();
 
   const [creating, setCreating] = useState(false);
-  const [editing, setEditing] = useState<Agent | null>(null);
-  const [submitting, setSubmitting] = useState(false);
 
   const { data: agents = [], isLoading, error } = useQuery({
     queryKey: ["agents"],
@@ -80,6 +76,15 @@ export default function Agents() {
     onError: (err) => console.error("Set Slack-active failed:", err),
   });
 
+  const deployMut = useMutation({
+    mutationFn: (id: string) => deployAgent(token!, id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["agents"] }),
+    onError: (err: Error) => {
+      console.error("Deploy failed:", err);
+      alert(`Deploy failed: ${err.message}`);
+    },
+  });
+
   // No dialog — click → create with defaults → open canvas immediately
   async function handleNewAgent() {
     if (creating) return;
@@ -95,20 +100,6 @@ export default function Agents() {
     } catch (err) {
       console.error("Create agent failed:", err);
       setCreating(false);
-    }
-  }
-
-  async function handleEditSave(config: AgentConfig) {
-    if (!editing) return;
-    setSubmitting(true);
-    try {
-      await updateAgent(token!, editing.id, config);
-      await qc.invalidateQueries({ queryKey: ["agents"] });
-      setEditing(null);
-    } catch (err) {
-      console.error("Save agent failed:", err);
-    } finally {
-      setSubmitting(false);
     }
   }
 
@@ -154,6 +145,12 @@ export default function Agents() {
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="font-semibold text-gray-900">{agent.name}</span>
                   <Badge variant="secondary" className="text-xs font-normal">{agent.config.role}</Badge>
+                  {!agent.deployed_at && (
+                    <Badge className="text-xs font-medium bg-amber-100 text-amber-800 hover:bg-amber-100 border border-amber-300">
+                      <span className="w-1.5 h-1.5 rounded-full bg-amber-500 inline-block mr-1.5" />
+                      Draft
+                    </Badge>
+                  )}
                   {agent.id === slackActiveId && (
                     <Badge className="text-xs font-medium bg-emerald-100 text-emerald-700 hover:bg-emerald-100 border border-emerald-200">
                       <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block mr-1.5" />
@@ -181,7 +178,17 @@ export default function Agents() {
                 </div>
               </div>
               <div className="flex items-center gap-1.5 shrink-0">
-                {agent.id !== slackActiveId && slackStatus?.connected && (
+                {!agent.deployed_at && (
+                  <Button
+                    size="sm"
+                    className="text-xs bg-amber-500 hover:bg-amber-600 text-white"
+                    disabled={deployMut.isPending}
+                    onClick={() => deployMut.mutate(agent.id)}
+                  >
+                    {deployMut.isPending && deployMut.variables === agent.id ? "Deploying…" : "Deploy"}
+                  </Button>
+                )}
+                {agent.deployed_at && agent.id !== slackActiveId && slackStatus?.connected && (
                   <Button
                     variant="ghost"
                     size="sm"
@@ -196,11 +203,8 @@ export default function Agents() {
                   to={`/agents/${agent.id}/canvas`}
                   className={cn(buttonVariants({ variant: "default", size: "sm" }), "bg-violet-600 hover:bg-violet-700 text-white text-xs")}
                 >
-                  Open Canvas
-                </Link>
-                <Button variant="ghost" size="sm" className="text-xs" onClick={() => setEditing(agent)}>
                   Edit
-                </Button>
+                </Link>
                 <Button
                   variant="ghost"
                   size="sm"
@@ -215,34 +219,6 @@ export default function Agents() {
         </div>
       )}
 
-      {/* Full edit dialog — existing agents only */}
-      <Dialog open={!!editing} onOpenChange={(o) => !o && setEditing(null)}>
-        <DialogContent className="max-w-xl max-h-[90vh] overflow-hidden flex flex-col p-0">
-          {/* Gradient header */}
-          <div className="bg-gradient-to-br from-violet-600 to-purple-700 px-6 py-5 shrink-0">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-white/20 flex items-center justify-center text-white font-bold text-sm">
-                {(editing as Agent)?.name?.slice(0, 2).toUpperCase()}
-              </div>
-              <div>
-                <p className="font-bold text-white text-base">{(editing as Agent)?.name}</p>
-                <p className="text-violet-200 text-xs">{(editing as Agent)?.config.role}</p>
-              </div>
-            </div>
-          </div>
-          <div className="overflow-y-auto p-6">
-            {editing && (
-              <AgentForm
-                agent={editing as Agent}
-                allAgents={agents}
-                onSubmit={handleEditSave}
-                onCancel={() => setEditing(null)}
-                submitting={submitting}
-              />
-            )}
-          </div>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }

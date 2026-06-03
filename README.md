@@ -1,8 +1,87 @@
-# AI Agent Orchestration Platform
+# Open Agent Orchestrator
 
-Build **agentic pipelines** — an LLM supervisor plus the sub-agents, tools, skills, and external integrations it needs — visually on a canvas, or via REST. Talk to a pipeline from the web UI or Slack DM. Watch every run live over SSE.
+Visual multi-agent pipelines. Build a supervisor with sub-agents, tools, and MCP servers on a canvas. Talk to it from the web or Slack. Works with any OpenAI-compatible LLM, Anthropic, or Gemini.
 
-A "pipeline" is the unit a user publishes: a root agent + its sub-agent tree + bound tools + MCP servers + channel bindings, identified by the root's config id. Chats and Slack threads always attach to **pipelines**, never to a bare sub-agent.
+```bash
+cp .env.example .env && docker compose up
+```
+
+→ `http://localhost` (UI) · `http://localhost:8000/docs` (API)
+
+---
+
+## Features
+
+Ordered by impact — most useful first.
+
+1. **Visual canvas for multi-agent pipelines.** React Flow + dagre. Drag a supervisor, attach sub-agents (recursive ReAct loops, depth-4 cap, cycles rejected at save), wire in built-in tools and MCP servers. Double-click to edit, hover to attach, color-coded by node type (supervisor > sub-agent > tool/MCP).
+2. **Multi-channel out of the box.** Web chat with file attachments (PDFs + images) AND Slack via Socket Mode (no public URL — Bolt + xapp-/xoxb- tokens). One pipeline can be Slack-active at a time; switch live without restart.
+3. **Bring-your-own LLM, any provider.** OpenAI, Anthropic, Google Gemini, vLLM, or anything OpenAI-compatible. Provider list is backend-driven (`GET /providers`) — add one with a one-line edit to `app/llm.py`. User-entered keys live in their browser localStorage (no server-side BYOK storage).
+4. **MCP integration.** Register external MCP servers, auto-discover their tools at attach time, bind them to any sub-agent. A sample MCP server is included for testing.
+5. **Reusable everything.** Sub-agents, tools, personas (named system prompts), skills (reusable knowledge docs), and tool credentials are all account-scoped and reusable across pipelines. Symmetric Attach / Detach / Delete UI on every reusable.
+6. **Live run monitoring.** SSE event stream per run: `run.started`, `tool.start`/`end`, `agent.message`, `usage`, `run.finished`. Backlog replay + live feed. Token accounting aggregates across sub-agent calls (contextvar propagation).
+7. **Draft → Deployed gating.** Pipelines start as Draft. They can't be used in chat or Slack until you explicitly click Deploy (which validates `llm.model`, `system_prompt`, sub-agent tree). Edits after deploy stay Deployed — no surprise re-validation.
+8. **Per-user tool credentials with pre-save validation.** `POST /tool-configs/{tool}/validate` pings the upstream (e.g. Tavily one-result search) before storing the key. Errors are scrubbed — submitted keys never bounce back to the client.
+9. **Rolling-summary memory.** N=10 verbatim tail, fold the oldest M=20 into `ChatDB.summary` once they exceed the threshold. `MessageDB` rows are never deleted (full audit trail).
+10. **Graceful recursion-limit fallback.** When LangGraph hits `max_steps`, the run finishes with a clean apology message instead of a half-baked tool-result tail.
+11. **Multi-user with JWT.** `fastapi-users` auth, per-user ownership on every row, `404 not 403` on cross-user reads (no existence leak).
+12. **SQLite by default, Postgres by URL swap.** Idempotent migrations via SQLAlchemy `inspect()` — no Alembic in v1, no startup error logs from "column already exists".
+13. **Docker Compose dev loop.** Full bind mount + anonymous volumes for `node_modules` / `.venv` → `docker compose down && up` = truly fresh install; restarts in between are instant. Vite polling enabled so macOS Docker bind mounts hot-reload reliably.
+
+---
+
+## What's in the box
+
+```
+backend/                          FastAPI + LangGraph
+  app/
+    api/                          REST routers (one file per resource)
+      agents.py                   AgentConfig CRUD + sub-agent tree validation + POST /deploy
+      chats.py                    Chat CRUD + reassign + message send (Draft pipelines rejected)
+      runs.py                     Run status + SSE event stream
+      providers.py                LLM provider catalogue (id + label)
+      mcp_servers.py              MCP CRUD + live tool discovery
+      personas.py / skills.py     Reusable system-prompt fragments / knowledge docs
+      tool_configs.py             Per-user tool credentials (validate before save)
+      slack.py                    Connect / disconnect / set-active (per-user)
+      health.py
+    runtime/
+      agent.py                    build_agent_tree() — recursive ReAct, contextvar token aggregation
+      tools.py                    Built-in tool registry (calculator, web_search, html_to_md, pdf_to_text, python_sandbox)
+      checkpointer.py             Redis checkpointer (within-run state)
+    services/run_service.py       Schedule + execute + persist + emit
+    integrations/
+      channels/slack_adapter.py   Bolt Socket Mode adapter
+      sample_mcp_server.py        Demo MCP server (timestamp + word_count tools)
+    db/
+      models.py                   SQLAlchemy 2.0 async ORM
+      repos.py                    Plain async helpers (caller owns the session)
+      seeds/personas.yaml         Default personas, loaded on startup
+    llm.py                        build_chat_model() — provider dispatch (openai/anthropic/google/vllm)
+    domain.py                     Pydantic schemas (AgentConfig, LLMConfig, MemoryConfig, RunEvent)
+    main.py                       FastAPI app + lifespan (Slack autostart, Redis checkpointer)
+
+frontend/                         React + Vite + ReactFlow + TanStack Query + shadcn/Tailwind
+  src/
+    pages/
+      Agents.tsx                  /pipelines list (Draft pill + Deploy button + hover Slack-active swap)
+      Canvas.tsx                  /pipelines/:id/canvas (header: Draft pill, Save/Deploy button)
+      Chat.tsx                    /chats (sidebar grouped by pipeline, message bubbles, SSE ticker)
+      Integrations.tsx            /integrations (Slack card: per-user connect/edit/disconnect)
+      Personas.tsx                /personas (CRUD + copy-default-as-mine)
+      Skills.tsx                  /skills (CRUD)
+      Login.tsx
+    components/
+      AgentCanvas.tsx             ReactFlow scene + left "Add Connection" panel (Sub-Agents / Tools / MCP)
+      AgentForm.tsx               Full edit form (provider dropdown driven by /providers)
+      PersonaPopup.tsx            Shared big-textarea dialog: New / Edit / Copy-from-default
+      Layout.tsx, RunEventsPanel.tsx, ui/* (shadcn)
+    api/                          One client per resource, all hit /api (Vite proxy → backend)
+    hooks/                        useAuth, useSSE
+    lib/                          llm-defaults (localStorage BYOK), utils, isPipelineRoot
+
+docker-compose.yml                postgres + redis + backend + frontend + mcp-sample
+```
 
 ---
 
@@ -11,251 +90,151 @@ A "pipeline" is the unit a user publishes: a root agent + its sub-agent tree + b
 ```mermaid
 flowchart LR
   subgraph FE["Frontend (React + ReactFlow + TanStack Query)"]
-    PG[/Pipelines list/]
-    CV[Canvas — visual editor<br/>nodes: Supervisor, Sub-Agent, Tool, MCP]
-    CH[Chats — messages, files,<br/>persona override, SSE events]
-    SK[Skills]
+    PG[/Pipelines/]
+    CV[Canvas]
+    CH[Chat + SSE]
+    IN[Integrations]
   end
 
   subgraph BE["Backend (FastAPI + asyncio + LangGraph)"]
-    AUTH[fastapi-users JWT]
     API[REST routers]
-    RS[run_service<br/>asyncio.create_task]
-    BA[build_agent_tree<br/>recursive sub-agents]
-    LL[ChatOpenAI<br/>vLLM / OpenAI / any compat]
-    TR[Tool registry<br/>+ MCP discovery]
-    SL[Slack adapter<br/>Bolt Socket Mode]
-    EM[RunEventEmitter<br/>in-process queue + DB]
+    RS[run_service]
+    BA[build_agent_tree]
+    LL[ChatOpenAI / Anthropic / Gemini / vLLM]
+    TR[Tool registry + MCP]
+    SL[Slack Socket Mode]
+    EM[RunEventEmitter]
   end
 
   subgraph DATA["Persistence"]
-    DB[(SQLAlchemy 2.0 async<br/>SQLite v1 — Postgres URL-swap)]
-    RD[(Redis<br/>LangGraph checkpointer)]
+    DB[(SQLAlchemy 2.0 async\nSQLite ↔ Postgres)]
+    RD[(Redis\ncheckpointer)]
   end
 
   FE -->|REST + SSE| API
-  API --> RS
-  RS --> BA
-  BA --> LL
+  API --> RS --> BA --> LL
   BA --> TR
   RS <--> DB
-  RS --> EM
-  EM -->|SSE| FE
+  RS --> EM -->|SSE| FE
   SL -->|inbound DM| RS
   RS -->|reply| SL
   BA -.checkpoint.-> RD
 ```
 
-Three boundaries — kept thin:
+Three boundaries, kept thin:
+- **Control plane** (`api/`) — body validation, owner checks, call repos/services.
+- **Runtime** (`runtime/`, `services/`) — agent-tree compilation, run scheduling, memory, retries.
+- **Persistence** (`db/`) — one ORM file, repo helpers, idempotent bootstrap.
 
-- **Control plane** (`backend/app/api/`) — routers do body validation, owner checks, and call repos/services.
-- **Runtime** (`backend/app/runtime/`, `backend/app/services/`) — agent-tree compilation, run scheduling, memory, retries.
-- **Persistence** (`backend/app/db/`) — one ORM file, repo helpers, idempotent schema bootstrap (`create_all` + `seed_defaults`).
-
----
-
-## What a pipeline is made of
-
-Every field is on the `AgentConfig` Pydantic model (`backend/app/domain.py`) and round-trips through `GET/PUT /agents`.
-
-| Component | Field | Purpose |
-|---|---|---|
-| Identity | `name`, `role`, `description`, `system_prompt` | Defaults exist; only `system_prompt` is enforced. Use a persona to override at chat-time. |
-| LLM | `llm: LLMConfig` | `base_url`, `api_key`, `model`, `temperature`, `max_tokens`, `timeout_s` — OpenAI-compatible (vLLM, OpenAI, LiteLLM, Anthropic-via-proxy). Frontend persists last-used in `localStorage` so new pipelines pre-fill. |
-| Memory | `memory: MemoryConfig` | Rolling summary (`type: "summary"`, default `N=10` verbatim tail, `M=20` summary batch). Also `"buffer"` and `"none"`. |
-| Limits | `limits.max_steps` | Hard cap on ReAct iterations per turn (`recursion_limit` passed to LangGraph). |
-| Tools | `tools: list[str]` | Names from the platform `REGISTRY` — `calculator`, `web_search`, `html_to_markdown`, `pdf_to_text`, `python_sandbox`. `GET /tools` returns `{name, display_name, description}` for each. |
-| Sub-agents | `subagents: list[UUID]` | Each is wrapped as a LangChain tool — the parent LLM calls it by name with a `task` string; the sub-agent runs its own ReAct loop. **Recursive, capped at depth 4.** Cycles rejected at `POST/PUT /agents` time via DFS. |
-| Skills | `skills: list[UUID]` | Persistent knowledge/instruction snippets (e.g. coding conventions, rubrics). Appended to `system_prompt` at run-time. |
-| MCP servers | `mcp_servers: list[UUID]` | External tool servers; tools discovered at every build via `langchain-mcp-adapters` then bound alongside built-ins. |
-| Channels | `channels: list[ChannelBinding]` | `{channel: "slack" | "web", external_id?}`. The slack binding is what routes Slack DMs to this pipeline. |
-
----
-
-## Per-chat overrides — personas
-
-Personas (`PersonaDB`) are named `system_prompt`s that override the pipeline's stored prompt for a specific chat. A persona belongs to one user, except for global personas (`user_id IS NULL`) which everyone sees read-only.
-
-- **Default Supervisor** is seeded on every app startup (`db/__init__.seed_defaults`) as a global — guarantees the persona dropdown is never empty.
-- Users can create their own personas inline in any "create chat" or "create sub-agent" form.
-- Globals cannot be edited or deleted (`update_persona`/`delete_persona` return None when the row's `user_id IS NULL`).
-
-The chat dialogs and the canvas inline "Create sub-agent" form share one UX pattern: a dropdown of available personas + a `+ Create persona` inline form. No `__none__` sentinel; no awkward dual-mode toggle.
-
----
-
-## Per-user tool credentials
-
-Some tools need user-provided keys (e.g. Tavily for `web_search`). These live in `UserToolConfigDB` keyed on `(user_id, tool_name)`:
-
-- `POST /tool-configs/{tool_name}/validate` — pings the upstream service (e.g. one-result Tavily search) before saving. Errors are scrubbed and logged with `type(exc).__name__` rather than raw exception text — submitted keys never bounce back to the client.
-- `PUT /tool-configs/{tool_name}` — persists the credential.
-- At run-time, `build_registry(tool_configs=…)` produces a per-user tool registry: stateless tools always included; credentialed tools included only when their key is present.
-
----
-
-## Multi-channel — web + Slack
-
-The web UI hits `POST /chats/{id}/messages` and watches `GET /runs/{id}/events` (SSE: `run.started`, `agent.message`, `usage`, `run.finished`).
-
-**Slack** runs as a single platform bot via Bolt Socket Mode (no public URL needed):
-
-- **BYO tokens via UI.** `POST /slack/connect {bot_token, app_token, agent_id?}` saves tokens to `UserDB`, atomically swaps the `slack` channel binding to the chosen pipeline (clears it from every other agent), and (re)starts the adapter live — no container restart needed.
-- **Single Slack-active pipeline.** Only one of your pipelines can hold the slack binding at a time. Connecting on pipeline B automatically clears it from pipeline A. The Pipelines page shows a green "Slack active" badge on whichever one is bound.
-- **Conversation continuity.** A Slack chat is keyed by `(user_id, channel_id, thread_ts, agent_id)`. Same pipeline + same thread → continue. **Switching pipelines starts a new conversation** even mid-thread, by design: the new pipeline gets a fresh `ChatDB` row; the old one stays archived under the old `agent_id`.
-- **Inbound flow** (`slack_adapter.handle_slack_message`): match `slack_user_id` → `UserDB`, pick the slack-bound pipeline (or fall back to most-recently-updated), find/create the chat, schedule a run, poll for completion, post the reply on the same thread.
-
----
-
-## File attachments
-
-The chat input accepts images + PDFs. `_process_files` (in `run_service`) routes them at run-time:
-
-- **PDF** → `pypdf` text extraction, prepended to the user message as `[Attached PDF: name]\n<pages>`.
-- **Image** → base64-encoded into a LangChain multimodal `image_url` content block, attached to the last `HumanMessage`. Works with any vision-capable model behind your OpenAI-compatible endpoint.
-
----
-
-## Memory — rolling summary
-
-Per-pipeline `MemoryConfig` keeps cross-turn memory in the DB, not in a graph checkpoint:
-
-- `type: "summary"` (default): verbatim tail of `N` messages; when unsummarised history exceeds `N+M`, the oldest `M` turns are folded into `ChatDB.summary` via one summarisation call. `MessageDB` rows are never deleted (audit trail).
-- `type: "buffer"`: last-N only.
-- `type: "none"`: pass everything.
-
-The summary is woven into the effective system prompt as a single "Earlier conversation summary" block; some providers (vLLM/Qwen) reject mid-conversation `SystemMessage`, so we never prepend one mid-thread.
-
-LangGraph's Redis checkpointer is still wired for **within-run** state (HITL interrupts, multi-step ReAct replay) — `thread_id = run_id` so within-run state never collides with cross-turn DB memory.
-
----
-
-## Live monitoring (SSE)
-
-`GET /runs/{id}/events` streams `RunEvent` records (`run.started`, `node.started`, `tool.start`/`tool.end`, `agent.message`, `usage`, `run.finished`, `run.error`) over Server-Sent Events. Endpoint accepts both `Authorization: Bearer` and `?token=` query param — EventSource can't send custom headers.
-
-Backlog rows from `RunEventDB` are flushed first (so a late subscriber doesn't miss anything), then live events from an in-process `EMITTERS` registry keyed by `run_id`.
-
----
-
-## DB session discipline
-
-The runtime takes care to **never pin a DB connection during an LLM call**. `_execute` splits a turn into three phases:
-
-1. **Pre-LLM**: load chat + agent config, insert the user message, resolve memory, fetch per-user tool configs — all in one short-lived session, then close.
-2. **LLM**: build LangChain messages + the agent tree + invoke. `build_agent_tree` accepts a `session_factory`, not a `session`, so each build opens its own short-lived session for MCP/sub-agent lookups and closes it before any `get_tools()` network call. **No DB session is held during the LLM round-trip.**
-3. **Post-LLM**: open a fresh session for the agent-message insert + `finalize_run`.
-
-This keeps the connection pool free for concurrent requests under load — important when scaling to Postgres.
+**No DB session held during the LLM call.** `_execute` splits a turn into pre-LLM (load + insert user message), LLM (build tree + invoke — `build_agent_tree` takes a `session_factory`, not a session), post-LLM (insert agent reply + finalize). Keeps the pool free under concurrent load.
 
 ---
 
 ## Setup
 
-### Full stack (Docker Compose — recommended)
+### Full stack (Docker — recommended)
 
 ```bash
-cp .env.example .env   # set OpenAI-compatible LLM creds, optional Slack tokens
+cp .env.example .env   # set LLM creds (any OpenAI-compatible provider), optional Slack tokens
 docker compose up
 ```
 
-Brings up: `ca-postgres` (Postgres 16), `ca-redis` (Redis 7), `ca-backend` (FastAPI + uvicorn), `ca-frontend` (Vite + nginx), `ca-mcp-sample` (a sample MCP server for testing).
+Services: `ca-postgres`, `ca-redis`, `ca-backend`, `ca-frontend`, `ca-mcp-sample`.
 
 - Backend: `http://localhost:8000` (OpenAPI at `/docs`)
-- Frontend: `http://localhost:80`
+- Frontend: `http://localhost`
+- Truly-fresh `down && up` reinstalls deps; quick `up` reuses cached volumes.
 
-`create_all()` runs at startup; ADD COLUMN migrations are wrapped in SAVEPOINTs so a duplicate-column error on Postgres rolls back only the savepoint, not the whole transaction. `seed_defaults()` then inserts the global Default Supervisor persona idempotently.
-
-### Backend only (SQLite, local Python)
+### Backend only
 
 ```bash
 cd backend
 cp .env.example .env
-make demo   # uv sync + uvicorn :8000
+make demo    # uv sync + uvicorn :8000 (SQLite)
+make test    # 66 tests
 ```
 
-For Postgres without docker: set `DATABASE_URL=postgresql+asyncpg://…` in `.env`.
+Postgres without Docker: set `DATABASE_URL=postgresql+asyncpg://…` in `.env`.
 
-### Slack (Socket Mode)
+### Slack
 
-Either set `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN` in `backend/.env` (adapter auto-starts in `lifespan`), or paste them in the UI: open a pipeline → Canvas → "Connect Slack" — backend saves tokens to your `UserDB` row and the adapter restarts immediately. To link your Slack identity: `PATCH /users/me {"slack_user_id":"U..."}`.
+Either set `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN` in `.env` (auto-starts in lifespan), or paste them in the UI at `/integrations`. The first user to connect owns the platform bot; subsequent connects atomically clear the previous owner's tokens.
+
+To link your Slack identity: `PATCH /users/me {"slack_user_id":"U..."}`.
 
 ---
 
-## Frontend (the Canvas)
+## API
 
-- `/pipelines` — list of root pipelines (computed: any agent NOT referenced as a sub-agent by another agent). Sub-agents are not listed here — they're edited inside the canvas.
-- `/pipelines/:id/canvas` — ReactFlow + dagre auto-layout, 4 node types (Supervisor violet, Sub Agent blue, Tool emerald, MCP amber). Hover any node → `+` button to attach. Double-click / right-click → properties sheet (full edit form). The left panel lets you attach existing sub-agents, create new ones inline with a persona, register new MCP servers, and toggle built-in tools (with API-key validation flow for credentialed tools).
-- `/chats/:id` — message list, multimodal input (image + PDF), live SSE event ticker, persona selector with inline `+ Create persona`, pipeline reassign dialog. Chats are grouped by pipeline in the sidebar.
-- `/skills` — skills CRUD.
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| POST | /auth/register | — | Create user |
+| POST | /auth/jwt/login | — | Returns JWT |
+| GET/PATCH | /users/me | JWT | Profile + `slack_user_id` |
+| GET/POST/PUT/DELETE | /agents | JWT | Full `AgentConfig` CRUD; POST/PUT validate sub-agent tree |
+| POST | /agents/{id}/deploy | JWT | Validate config + mark Deployed |
+| GET | /providers | JWT | LLM provider catalogue (id + label) |
+| GET/POST/PUT/DELETE | /personas, /skills | JWT | Owned + read-only globals |
+| GET/POST/DELETE | /mcp-servers | JWT | + `GET /mcp-servers/{id}/tools` for live discovery |
+| GET/PUT/DELETE | /tool-configs | JWT | + `POST /tool-configs/{tool}/validate` |
+| GET | /tools | — | Built-in tool catalogue |
+| GET/POST/PATCH/DELETE | /chats | JWT | PATCH reassigns to a Deployed pipeline only |
+| POST | /chats/{id}/messages | JWT | Schedule a run; accepts file attachments |
+| GET | /chats/{id}/messages | JWT | History |
+| GET | /runs/{id} | JWT | Status + tokens + cost |
+| GET | /runs/{id}/events | JWT or `?token=` | SSE (backlog + live) |
+| GET | /slack/status | JWT | Per-user `{connected, active_agent_id}` |
+| POST | /slack/connect, /slack/active, /slack/disconnect | JWT | Single-owner platform bot |
+| GET | /health | — | `{"status": "ok"}` |
 
-The frontend persists last-used LLM credentials in `localStorage` (`llm-defaults.ts`) so a fresh pipeline pre-fills provider URL + model + key. Sub-agent inline create forms inherit the supervisor's LLM config.
+---
+
+## Notable design decisions
+
+- **Pipeline = root agent.** Computed (`pipeline = agent NOT referenced as subagent`), no `is_pipeline` flag. Stable under in-place edits.
+- **Supervisor tree, not DAG.** The agent IS the workflow. Sub-agents are LangChain tools, depth-4 capped, cycles rejected at save.
+- **Multi-provider, one config.** `LLMConfig.provider` → dispatch in `build_chat_model`. UI shows uniform base-url / api-key / model fields; provider quirks handled in backend.
+- **No chat memory in the checkpointer.** History rebuilt from `MessageDB` each turn (+ rolling summary on `ChatDB`). Redis is reserved for within-run state.
+- **No Alembic in v1.** `create_all()` + Inspector-driven additive migrations (no startup ERROR logs).
+- **Draft → Deployed is explicit.** No auto re-Draft on edit; deploy validates and sets `deployed_at` once.
+- **Single-owner platform Slack bot.** `POST /slack/connect` clears any prior user's tokens before saving yours. Per-user `/slack/status` so new users see "Connect", not "Connected".
+- **404 not 403 on cross-user reads.** No existence leak.
+- **SSE dual auth.** EventSource can't send headers → `?token=` accepted alongside `Authorization: Bearer`.
+- **Tool credentials never echo back.** `validate` returns generic errors, logs only exception class.
+- **Reusable everything has symmetric UI.** Sub-agents and MCP servers both expose `Attach` / `Detach` / `× Delete` with consistent colors (emerald / amber-blue / red).
+
+---
+
+## Roadmap
+
+Ordered by likely sequence.
+
+- [ ] **Subscription tier with server-side LLM defaults.** Free = BYOK (current). Paid = backend-managed key pool, no user setup. The free/paid flag already exists on `UserDB.plan`.
+- [ ] **Swarm-style collaboration.** Peer-to-peer agent handoff (not just supervisor → sub). Complements the current hierarchy.
+- [ ] **Scheduled runs.** Cron-style triggers — fire a pipeline on a schedule, post output to Slack / web / webhook.
+- [ ] **WhatsApp integration.** Second messaging channel alongside Slack (Twilio or Meta Cloud API).
+- [ ] **Open-source pipeline catalogue.** Browse + import community pipelines (similar to GPT Store / Replit templates, but pipelines and skills).
+- [ ] **Planner-decider node.** A router in front of the supervisor that classifies queries before dispatching.
+- [ ] **Streaming tokens.** SSE already streams events; pipe per-token deltas to the UI for faster perceived latency.
+- [ ] **Langfuse tracing.** Drop-in callback handler — already designed (see notes below).
+- [ ] **Human-in-the-loop.** LangGraph interrupt → DB-backed approval queue → resume.
+- [ ] **Per-user Slack BYOK.** Drop the single-owner platform bot model; each user gets their own Socket Mode connection.
 
 ---
 
 ## Tests
 
 ```bash
-cd backend
-make test    # 68 tests
+cd backend && make test   # 66 tests
 ```
 
-Unit + integration coverage: auth, agent CRUD with sub-agent tree validation (cycle, depth, cross-user, name-collides-with-tool), persona/skill globals + ownership, tool-config validation flow, MCP discovery, chat + run lifecycle, Slack inbound dispatch (mocked + live), memory rolling summary, multimodal file handling, sub-agent recursive build, **live LLM end-to-end** (skipped without creds — vLLM/OpenAI/etc).
+Unit + integration: auth, agent CRUD with sub-agent tree validation (cycle / depth / cross-user / tool-name collision), Draft-rejection gating, persona/skill globals + ownership, tool-config validation flow, MCP discovery, chat + run lifecycle, Slack inbound dispatch, memory rolling summary, multimodal file handling, sub-agent recursive build, **live LLM end-to-end** (skipped without creds).
 
-Frontend typechecks with `tsc --noEmit`. Backend lints clean with `ruff check`.
-
----
-
-## API endpoints
-
-| Method | Path | Auth | Notes |
-|---|---|---|---|
-| POST | /auth/register | No | Create user |
-| POST | /auth/jwt/login | No | Returns JWT |
-| GET/PATCH | /users/me | JWT | Profile + `slack_user_id` |
-| GET/POST/PUT/DELETE | /agents | JWT | Full `AgentConfig` CRUD. POST/PUT validate the sub-agent tree (cycle, depth, name-collides-with-tool). |
-| GET/POST/PUT/DELETE | /personas | JWT | Owned + read-only globals (`Default Supervisor` is seeded). |
-| GET/POST/PUT/DELETE | /skills | JWT | Reusable system-prompt fragments. |
-| GET/POST/PUT/DELETE | /mcp-servers | JWT | External MCP tool servers. `GET /mcp-servers/{id}/tools` triggers live discovery. |
-| GET | /tool-configs | JWT | List per-user tool credentials. |
-| POST | /tool-configs/{tool}/validate | JWT | Ping upstream with the submitted key — generic error message, structured log. |
-| PUT/DELETE | /tool-configs/{tool} | JWT | Upsert / drop a credential. |
-| GET | /tools | No | Available tool names + `display_name` + descriptions. |
-| GET/POST/PATCH/DELETE | /chats | JWT | PATCH reassigns `agent_id` / `persona_id`. |
-| POST | /chats/{id}/messages | JWT | Schedule a run, returns `run_id`. Accepts file attachments. |
-| GET | /chats/{id}/messages | JWT | Message history. |
-| GET | /runs/{id} | JWT | Run status + tokens + cost. |
-| GET | /runs/{id}/events | JWT or `?token=` | SSE stream (backlog + live). |
-| GET | /slack/status | JWT | `{connected, active_agent_id}`. |
-| POST | /slack/connect | JWT | Save tokens + atomically swap the single Slack-active pipeline + (re)start adapter live. |
-| POST | /slack/disconnect | JWT | Clear tokens + stop adapter. |
-| GET | /health | No | `{"status": "ok"}` |
+Frontend: `npx tsc --noEmit` clean. Backend: `ruff check` clean.
 
 ---
 
-## Notable design decisions
-
-- **Pipeline = published unit.** A root agent + its full sub-agent tree + tools + MCP. Computed as roots — no `is_pipeline` schema flag — `pipeline = agent NOT referenced as subagent by anyone`. Stable under in-place edits, zero migration cost.
-- **Supervisor tree, not DAG.** The agent IS the workflow. Sub-agents are tools, depth-4 capped, cycles rejected at save. No separate workflow primitive, no compiler.
-- **OpenAI-compatible only.** One `ChatOpenAI` model class for vLLM, OpenAI, LiteLLM, Anthropic-via-proxy, anything. Model swap is a base URL change.
-- **No checkpointer for chat memory.** History rebuilt from `MessageDB` each turn (with rolling summary on `ChatDB.summary`). Redis seam reserved for within-run HITL.
-- **No Alembic in v1.** `create_all()` + inline ALTER TABLEs (savepoint-wrapped for Postgres-correctness). v2 swaps `DATABASE_URL` to Postgres and bolts on Alembic.
-- **MAX_AGENT_DEPTH = 4.** Enforced at config save (DFS cycle + depth check) AND at runtime (defence in depth).
-- **404, not 403, on cross-user reads.** No existence leak.
-- **SSE dual auth.** EventSource can't send headers, so `?token=` is accepted in addition to `Authorization: Bearer`.
-- **Hard-delete agents, nullable chat FK.** Deleting an agent sets `ChatDB.agent_id = NULL`. User reassigns via `PATCH /chats/{id}` (UI only lists pipelines, not sub-agents).
-- **Sub-agent name uniqueness vs tool registry.** A sub-agent's `name` becomes a LangChain tool name on its parent — colliding with a built-in tool would shadow it. Rejected at save.
-- **Tool credentials never echo back.** `POST /tool-configs/{tool}/validate` returns a generic error to the client and logs only the exception class — guards against accidental key leak via reflected error text.
-
----
-
-## Deferred (out of v1 scope, design-ready)
-
-Per `project-deferred-features` memory: standalone workflows, streaming token output, planner-as-node, schedules (cron), Langfuse tracing, HITL pauses, guardrails enforcement, per-user Slack BYOK (currently last-write-wins single-platform-bot).
-
----
-
-## Optional — Langfuse tracing
+## Langfuse (optional)
 
 ```bash
 pip install langfuse
@@ -264,7 +243,7 @@ export LANGFUSE_SECRET_KEY=sk-...
 ```
 
 ```python
-# In run_service._execute, add to the invoke config:
+# run_service._execute → invoke config:
 from langfuse.langchain import CallbackHandler
-config={"callbacks": [CallbackHandler()], "recursion_limit": ...},
+config={"callbacks": [CallbackHandler()], "recursion_limit": ...}
 ```

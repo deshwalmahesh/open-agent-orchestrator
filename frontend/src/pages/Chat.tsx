@@ -116,7 +116,7 @@ export default function ChatPage() {
     for (const chat of chats) {
       const key = chat.agent_id ?? "__no_agent__";
       if (!map.has(key)) {
-        map.set(key, { agentName: chat.agent_name ?? "No Agent", chats: [] });
+        map.set(key, { agentName: chat.agent_name ?? "No Pipeline", chats: [] });
       }
       map.get(key)!.chats.push(chat);
     }
@@ -385,7 +385,8 @@ function ReassignDialog({
   });
 
   // Chats are reassigned to whole pipelines (roots), not internal sub-agents.
-  const pipelines = agents.filter((a) => isPipelineRoot(a, agents));
+  // Drafts are excluded — they can't be used until deployed.
+  const pipelines = agents.filter((a) => isPipelineRoot(a, agents) && !!a.deployed_at);
 
   async function handleSave() {
     if (!chatId || !agentId) return;
@@ -450,9 +451,13 @@ function NewChatDialog({
     enabled: open,
   });
 
-  // New chat picks a pipeline (root), not an internal sub-agent.
-  const pipelines = agents.filter((a) => isPipelineRoot(a, agents));
+  // New chat picks a deployed pipeline (root). Drafts excluded — they must be
+  // deployed before they can be used.
+  const allPipelines = agents.filter((a) => isPipelineRoot(a, agents));
+  const pipelines = allPipelines.filter((a) => !!a.deployed_at);
   const noPipelines = !agentsLoading && pipelines.length === 0;
+  // If the user has pipelines but they're all drafts, surface a different CTA.
+  const onlyDrafts = noPipelines && allPipelines.length > 0;
 
   async function handleCreate() {
     if (!agentId) return;
@@ -480,16 +485,20 @@ function NewChatDialog({
         {noPipelines ? (
           <div className="py-6 text-center space-y-4">
             <div>
-              <p className="text-sm font-medium text-zinc-900">No pipelines yet</p>
+              <p className="text-sm font-medium text-zinc-900">
+                {onlyDrafts ? "No deployed pipelines" : "No pipelines yet"}
+              </p>
               <p className="text-xs text-zinc-500 mt-1">
-                A chat runs against a pipeline. Build one first, then come back here.
+                {onlyDrafts
+                  ? "All your pipelines are still in Draft. Deploy one to use it in a chat."
+                  : "A chat runs against a pipeline. Build one first, then come back here."}
               </p>
             </div>
             <Button
               className="bg-violet-600 hover:bg-violet-700 text-white"
               onClick={() => { onOpenChange(false); navigate("/agents"); }}
             >
-              Create your first pipeline
+              {onlyDrafts ? "Go to Pipelines" : "Create your first pipeline"}
             </Button>
           </div>
         ) : (

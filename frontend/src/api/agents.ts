@@ -20,3 +20,7 @@ export async function updateAgent(token: string, id: string, config: AgentConfig
 export async function deleteAgent(token: string, id: string): Promise<void> {
   return apiFetch(`/agents/${id}`, { method: "DELETE" }, token);
 }
+
+export async function deployAgent(token: string, id: string): Promise<Agent> {
+  return apiFetch(`/agents/${id}/deploy`, { method: "POST" }, token);
+}

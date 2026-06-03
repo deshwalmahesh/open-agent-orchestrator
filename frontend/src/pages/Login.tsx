@@ -52,7 +52,7 @@ export default function Login() {
     <div className="min-h-screen flex items-center justify-center bg-muted/40">
       <Card className="w-full max-w-sm">
         <CardHeader>
-          <CardTitle>Agent Platform</CardTitle>
+          <CardTitle>Multi Agent Orchestrator</CardTitle>
         </CardHeader>
         <CardContent>
           <Tabs defaultValue="login">

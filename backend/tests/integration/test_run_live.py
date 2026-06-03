@@ -38,6 +38,7 @@ def test_post_message_runs_and_persists(client, signup_and_login, auth_header):
     token = signup_and_login()
     h = auth_header(token)
     agent = client.post("/agents", json=_agent_payload(), headers=h).json()
+    assert client.post(f"/agents/{agent['id']}/deploy", headers=h).status_code == 200
     chat = client.post("/chats", json={"agent_id": agent["id"]}, headers=h).json()
 
     r = client.post(f"/chats/{chat['id']}/messages", json={"text": "Say hi."}, headers=h)
@@ -111,6 +112,10 @@ def test_supervisor_delegates_to_subagent(client, signup_and_login, auth_header)
     assert boss.status_code == 201, boss.text
     boss_id = boss.json()["id"]
 
+    # Deploy both before use — chats reject Draft pipelines.
+    assert client.post(f"/agents/{researcher_id}/deploy", headers=h).status_code == 200
+    assert client.post(f"/agents/{boss_id}/deploy", headers=h).status_code == 200
+
     # 3. Create chat, send message
     chat = client.post("/chats", json={"agent_id": boss_id}, headers=h).json()
     r = client.post(
@@ -155,6 +160,7 @@ def test_cross_user_run_returns_404(client, signup_and_login, auth_header):
     alice = signup_and_login("alice@example.com")
     bob = signup_and_login("bob@example.com")
     agent = client.post("/agents", json=_agent_payload(), headers=auth_header(alice)).json()
+    assert client.post(f"/agents/{agent['id']}/deploy", headers=auth_header(alice)).status_code == 200
     chat = client.post("/chats", json={"agent_id": agent["id"]}, headers=auth_header(alice)).json()
     run_id = client.post(
         f"/chats/{chat['id']}/messages", json={"text": "hi"}, headers=auth_header(alice)

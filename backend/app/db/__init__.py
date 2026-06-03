@@ -43,39 +43,38 @@ async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
 
 async def create_all() -> None:
     """Idempotent schema bootstrap — no Alembic in v1; prod swaps in migrations."""
-    from sqlalchemy import text
-    from sqlalchemy.exc import OperationalError, ProgrammingError
+    from sqlalchemy import inspect, text
 
     from app.db import models  # noqa: F401 — register tables with Base.metadata
     log.info("db.create_all", url=get_settings().database_url)
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Inline column migration: ADD COLUMN raises if the column already exists.
-        # SQLite has no IF NOT EXISTS for ADD COLUMN, and on Postgres a failed DDL
-        # aborts the whole transaction (next statement gets "transaction is aborted"
-        # until ROLLBACK). Wrap each ALTER in a SAVEPOINT so a duplicate-column error
-        # only rolls back that savepoint, leaving the parent transaction valid.
-        for col in (
-            "plan VARCHAR(20) NOT NULL DEFAULT 'free'",
-            "slack_bot_token VARCHAR(200)",
-            "slack_app_token VARCHAR(200)",
-        ):
-            try:
-                async with conn.begin_nested():
-                    await conn.execute(text(f'ALTER TABLE "user" ADD COLUMN {col}'))
-            except (OperationalError, ProgrammingError):
-                pass
-        # Drop obsolete columns. Idempotent via SAVEPOINT — already-dropped
-        # raises, which we swallow. Persona moved from per-chat to per-agent
-        # ownership; persona_id on chats is dead code.
-        for stmt in (
-            'ALTER TABLE chats DROP COLUMN persona_id',
-        ):
-            try:
-                async with conn.begin_nested():
-                    await conn.execute(text(stmt))
-            except (OperationalError, ProgrammingError):
-                pass
+
+        # Inline column migration. Inspect the existing schema first so we
+        # don't ALTER a column that's already there — that avoids the noisy
+        # Postgres ERROR log on every startup.
+        def _cols(sync_conn, table: str) -> set[str]:
+            return {c["name"] for c in inspect(sync_conn).get_columns(table)}
+
+        adds: dict[str, list[tuple[str, str]]] = {
+            "user": [
+                ("plan", "VARCHAR(20) NOT NULL DEFAULT 'free'"),
+                ("slack_bot_token", "VARCHAR(200)"),
+                ("slack_app_token", "VARCHAR(200)"),
+            ],
+            "agents": [("deployed_at", "TIMESTAMP WITH TIME ZONE")],
+        }
+        for table, cols in adds.items():
+            existing = await conn.run_sync(lambda sc, t=table: _cols(sc, t))
+            quoted = f'"{table}"' if table == "user" else table
+            for name, defn in cols:
+                if name not in existing:
+                    await conn.execute(text(f"ALTER TABLE {quoted} ADD COLUMN {name} {defn}"))
+
+        # Drop obsolete columns. Persona moved from per-chat to per-agent.
+        chat_cols = await conn.run_sync(lambda sc: _cols(sc, "chats"))
+        if "persona_id" in chat_cols:
+            await conn.execute(text("ALTER TABLE chats DROP COLUMN persona_id"))
 
 
 _PERSONAS_YAML = Path(__file__).parent / "seeds" / "personas.yaml"

@@ -33,6 +33,9 @@ class AgentDB(Base):
     user_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("user.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(120))
     config: Mapped[dict] = mapped_column(JSON)  # full AgentConfig dump
+    # NULL = Draft (cannot be used in chats / Slack). Set by POST /agents/{id}/deploy.
+    # Edits after deploy do NOT reset this — explicit user choice.
+    deployed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

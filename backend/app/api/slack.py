@@ -12,11 +12,12 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_async_session
 from app.db.models import AgentDB, UserDB
+from app.db.repos import get_agent
 from app.users import current_active_user
 
 router = APIRouter(prefix="/slack", tags=["slack"])
@@ -68,13 +69,14 @@ async def _active_slack_agent_id(session: AsyncSession, *, user_id: UUID) -> UUI
 
 @router.get("/status")
 async def status(
-    request: Request,
     user: Annotated[UserDB, Depends(current_active_user)],
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> dict:
-    adapter = getattr(request.app.state, "slack", None)
+    # Per-user: this user is "connected" iff they own the saved tokens.
+    # Single-owner platform bot — POST /slack/connect clears other users' tokens.
+    connected = bool(user.slack_bot_token and user.slack_app_token)
     active = await _active_slack_agent_id(session, user_id=user.id)
-    return {"connected": adapter is not None, "active_agent_id": str(active) if active else None}
+    return {"connected": connected, "active_agent_id": str(active) if active else None}
 
 
 @router.post("/connect")
@@ -89,17 +91,31 @@ async def connect(
     If `agent_id` is provided, that pipeline becomes the single Slack-active one for
     this user — the slack ChannelBinding is cleared from every other agent and added
     to this one atomically."""
-    # Persist tokens so the adapter restarts automatically on next boot
+    # Single-owner platform bot: clear any other user's saved tokens before
+    # claiming ownership. Prevents stale "Connected" UI for previous owners.
+    await session.execute(
+        update(UserDB)
+        .where(UserDB.id != user.id, UserDB.slack_bot_token.isnot(None))
+        .values(slack_bot_token=None, slack_app_token=None)
+    )
     user.slack_bot_token = body.bot_token
     user.slack_app_token = body.app_token
     await session.commit()
 
-    # Single-active-pipeline binding swap
+    # Single-active-pipeline binding swap. Reject Draft pipelines — they can't
+    # be used in chat or Slack until explicitly deployed.
     if body.agent_id:
         try:
-            await _apply_single_slack_binding(session, user_id=user.id, active_agent_id=UUID(body.agent_id))
+            agent_uuid = UUID(body.agent_id)
         except ValueError:
-            pass  # malformed agent_id — skip rather than 400 (tokens still saved)
+            agent_uuid = None  # malformed — skip the swap (tokens still saved)
+        if agent_uuid is not None:
+            target = await get_agent(session, agent_id=agent_uuid, user_id=user.id)
+            if target is None:
+                raise HTTPException(status_code=404, detail="agent not found")
+            if target.deployed_at is None:
+                raise HTTPException(status_code=400, detail="pipeline is in Draft — deploy it before binding to Slack")
+            await _apply_single_slack_binding(session, user_id=user.id, active_agent_id=agent_uuid)
 
     # Tear down existing adapter if running
     existing = getattr(request.app.state, "slack", None)
@@ -134,6 +150,11 @@ async def set_active(
         agent_uuid = UUID(body.agent_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid agent_id")
+    target = await get_agent(session, agent_id=agent_uuid, user_id=user.id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+    if target.deployed_at is None:
+        raise HTTPException(status_code=400, detail="pipeline is in Draft — deploy it before binding to Slack")
     await _apply_single_slack_binding(session, user_id=user.id, active_agent_id=agent_uuid)
     active = await _active_slack_agent_id(session, user_id=user.id)
     return {"active_agent_id": str(active) if active else None}

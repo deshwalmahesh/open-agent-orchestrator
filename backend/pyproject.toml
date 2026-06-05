@@ -25,6 +25,7 @@ dependencies = [
     "slack-bolt>=1.28.0",
     "slack-sdk>=3.42.0",
     "slowapi>=0.1.9",
+    "twilio>=9.0.0",
     "sqlalchemy[asyncio]>=2.0.36",
     "sse-starlette>=3.4.4",
     "structlog>=25.5.0",

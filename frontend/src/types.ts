@@ -30,7 +30,7 @@ export interface Limits {
 }
 
 export interface ChannelBinding {
-  channel: "slack" | "web";
+  channel: "slack" | "web" | "whatsapp";
   external_id: string;
 }
 
@@ -80,7 +80,7 @@ export interface Chat {
   id: string;
   agent_id: string;
   agent_name?: string | null;
-  channel: "web" | "slack";
+  channel: "web" | "slack" | "whatsapp";
   external_thread_id?: string | null;
   title?: string | null;
   // Snippet of the first user message — populated by /chats list, undefined elsewhere.

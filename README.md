@@ -1,6 +1,6 @@
 # Open Agent Orchestrator
 
-Visual multi-agent pipelines (you know them as "Multi Agent workflows"). Build a supervisor with sub-agents, tools, and MCP servers on a canvas. Talk to it from the web or Slack. Works with any OpenAI-compatible LLM, Anthropic, or Gemini.
+Visual multi-agent pipelines (you know them as "Multi Agent workflows"). Build a supervisor with sub-agents, tools, and MCP servers on a canvas. Talk to it from the web, Slack, or WhatsApp. Works with any OpenAI-compatible LLM, Anthropic, or Gemini.
 
 ![Canvas](assets/canvas.png)
 
@@ -23,7 +23,7 @@ cp .env.example .env && docker compose up
 Ordered by impact — most useful first.
 
 1. **Visual canvas for multi-agent pipelines.** React Flow + dagre. Drag a supervisor, attach sub-agents (recursive ReAct loops, depth-4 cap, cycles rejected at save), wire in built-in tools and MCP servers. Double-click to edit, hover to attach, color-coded by node type (supervisor > sub-agent > tool/MCP).
-2. **Multi-channel, one inbox.** Web chat with file attachments (PDFs + images) AND Slack via Socket Mode (no public URL — Bolt + xapp-/xoxb- tokens). Slack DMs land as `ChatDB` rows keyed by `(channel_id, thread_ts)` and show up in the web `/chats` sidebar alongside browser-started chats — so you can review, continue, or reassign a Slack thread from the platform. One pipeline can be Slack-active at a time; switch live without restart.
+2. **Multi-channel, one inbox.** Web chat with file attachments (PDFs + images), Slack via Socket Mode (no public URL — Bolt + xapp-/xoxb- tokens), AND WhatsApp via Twilio (webhook-based, per-user credentials). All channels land as `ChatDB` rows and show up in the same `/chats` sidebar. Slack DMs keyed by `(channel_id, thread_ts)`; WhatsApp threads keyed by contact phone number. One pipeline per channel active at a time; switch live without restart.
 3. **Bring-your-own LLM, any provider.** OpenAI, Anthropic, Google Gemini, vLLM, or anything OpenAI-compatible. Provider list is backend-driven (`GET /providers`) — add one with a one-line edit to `app/llm.py`. User-entered keys live in their browser localStorage (no server-side BYOK storage).
 4. **MCP integration.** Register external MCP servers, auto-discover their tools at attach time, bind them to any sub-agent. A sample MCP server is included for testing.
 5. **Reusable, modifiable pipelines.** Every agent is independently addressable: it can be a *root* (pipeline) AND simultaneously be wired into another pipeline as a sub-agent — no separate "template" type, no clone-to-fork (computed `pipeline = NOT referenced as subagent`). Sub-agents, tools, personas (named system prompts), skills (reusable knowledge docs), and tool credentials are all account-scoped, attachable to N pipelines, and modifiable in place — edits propagate to every pipeline that references them. Symmetric Attach / Detach / Delete UI on every reusable.
@@ -52,6 +52,7 @@ backend/                          FastAPI + LangGraph
       personas.py / skills.py     Reusable system-prompt fragments / knowledge docs
       tool_configs.py             Per-user tool credentials (validate before save)
       slack.py                    Connect / disconnect / set-active (per-user)
+      whatsapp.py                 Connect / disconnect / set-active + public webhook
       health.py
     runtime/
       agent.py                    build_agent_tree() — recursive ReAct, contextvar token aggregation
@@ -60,6 +61,7 @@ backend/                          FastAPI + LangGraph
     services/run_service.py       Schedule + execute + persist + emit
     integrations/
       channels/slack_adapter.py   Bolt Socket Mode adapter
+      channels/whatsapp_adapter.py Twilio WhatsApp adapter (per-user, stateless REST)
       sample_mcp_server.py        Demo MCP server (timestamp + word_count tools)
     db/
       models.py                   SQLAlchemy 2.0 async ORM
@@ -114,6 +116,7 @@ flowchart LR
     LL[ChatOpenAI / Anthropic<br/>Gemini / vLLM dispatch]
     TR[Built-in tools<br/>+ MCP discovery]
     SL[Slack Socket Mode<br/>single-owner bot]
+    WA[WhatsApp webhook<br/>per-user Twilio]
     EM[RunEventEmitter<br/>SSE fan-out]
   end
 
@@ -129,6 +132,8 @@ flowchart LR
   RS --> EM -->|SSE backlog + live| FE
   SL -->|inbound DM ⇒ ChatDB| RS
   RS -->|reply ⇒ same thread| SL
+  WA -->|inbound webhook ⇒ ChatDB| RS
+  RS -->|async reply via REST| WA
   BA -.checkpoint.-> RD
   IN -->|connect/disconnect/active| API
   PS -->|reusables attach to N pipelines| API
@@ -138,12 +143,13 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-  U["UserDB<br/>(JWT identity + optional slack_user_id)"]
+  U["UserDB<br/>(JWT identity + optional slack_user_id<br/>+ optional Twilio WhatsApp creds)"]
   A1["AgentDB<br/>(root = pipeline)"]
   A2["AgentDB<br/>(sub-agent)"]
   A3["AgentDB<br/>(sub-agent — shared)"]
   CH1["ChatDB<br/>channel='web'"]
   CH2["ChatDB<br/>channel='slack'<br/>external_thread_id=C123:1.234"]
+  CH4["ChatDB<br/>channel='whatsapp'<br/>external_thread_id=whatsapp:+1234"]
   CH3["ChatDB<br/>channel='web'"]
   M["MessageDB<br/>(append-only, full audit)"]
   R["RunDB + RunEventDB<br/>(status, tokens, SSE backlog)"]
@@ -158,6 +164,7 @@ flowchart TD
   A2 -- can also be a pipeline root --> CH3
   A1 -- backs N --> CH1
   A1 -- backs N (Slack threads) --> CH2
+  A1 -- backs N (WhatsApp contacts) --> CH4
   CH1 -- has many --> M
   CH2 -- has many --> M
   CH1 -- triggers --> R
@@ -168,7 +175,7 @@ flowchart TD
 
 Key relationships:
 - **User → Pipelines:** one user owns many root agents (pipelines). The same `AgentDB` row can be a root AND be referenced as a sub-agent by another pipeline — no `is_pipeline` flag, computed on read.
-- **Pipeline → Chats:** one pipeline backs many chats. Web chats are user-created; Slack chats auto-spawn on first DM, keyed by `(channel_id, thread_ts)` — they appear in the same `/chats` sidebar.
+- **Pipeline → Chats:** one pipeline backs many chats. Web chats are user-created; Slack chats auto-spawn on first DM, keyed by `(channel_id, thread_ts)`; WhatsApp chats auto-spawn on first inbound message, keyed by contact phone number — all appear in the same `/chats` sidebar.
 - **Chat → Messages:** append-only `MessageDB` for full audit; older messages fold into `ChatDB.summary` (N=10 tail, M=20 fold).
 - **Reusables:** Sub-agents, personas, skills, MCP servers, and tool credentials are user-scoped and can be attached to any number of pipelines; edits propagate live.
 
@@ -204,7 +211,7 @@ Services: `ca-postgres`, `ca-redis`, `ca-backend`, `ca-frontend`, `ca-mcp-sample
 cd backend
 cp .env.example .env
 make demo    # uv sync + uvicorn :8000 (SQLite)
-make test    # 66 tests
+make test    # 73 tests
 ```
 
 Postgres without Docker: set `DATABASE_URL=postgresql+asyncpg://…` in `.env`.
@@ -214,6 +221,18 @@ Postgres without Docker: set `DATABASE_URL=postgresql+asyncpg://…` in `.env`.
 Either set `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN` in `.env` (auto-starts in lifespan), or paste them in the UI at `/integrations`. The first user to connect owns the platform bot; subsequent connects atomically clear the previous owner's tokens.
 
 To link your Slack identity: `PATCH /users/me {"slack_user_id":"U..."}`.
+
+### WhatsApp (Twilio)
+
+Per-user, multi-user concurrent — each platform user connects their own Twilio account. External contacts message the bot owner's pipeline.
+
+1. Create a Twilio account and enable the WhatsApp Sandbox (or a Business number).
+2. In `/integrations`, enter your Account SID, Auth Token, and From Number (`whatsapp:+14155238886`).
+3. Set the **Webhook Base URL** to your public URL (e.g. `https://your-app.example.com`).
+4. Copy the computed webhook URL and paste it into Twilio Console → WhatsApp Sandbox → "When a message comes in".
+5. (Optional) Enter the sandbox join code — the UI generates a `wa.me` deep link to share with testers.
+
+Or bootstrap from env: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_FROM`, `BASE_URL`.
 
 ### Deploy (single-image, any Docker host)
 
@@ -234,10 +253,13 @@ docker run -p 8000:8000 -e JWT_SECRET=$(openssl rand -hex 32) agent-orchestrator
 - `REDIS_URL` — defaults to empty. Without Redis, runs still execute but lose within-run LangGraph checkpoints (fine for stateless chat; needed for future HITL).
 - `TAVILY_API_KEY` — platform-wide `web_search` credential. Users can also bring their own via `/tool-configs`.
 - `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN` — auto-start Slack at boot. If unset, the first user to connect via `/integrations` owns the platform bot.
+- `TWILIO_ACCOUNT_SID` + `TWILIO_AUTH_TOKEN` + `TWILIO_WHATSAPP_FROM` — optional bootstrap for WhatsApp. Per-user creds entered via `/integrations` take priority.
+- `BASE_URL` — public URL of this server (e.g. `https://your-app.example.com`). Used to compute webhook URLs. Per-user `webhook_base_url` overrides this.
 
 **Caveats:**
 - SQLite + ephemeral container disk = data lost on every redeploy. Attach a volume at `/app/` (or `/app/dev.db`) or use managed Postgres.
 - Slack uses outbound WebSocket (Socket Mode) — needs a host that keeps long-running processes alive (no idle-sleep tiers).
+- WhatsApp uses inbound webhooks — needs a publicly reachable URL (ngrok for dev, any host for prod). Twilio sandbox sessions expire after 3 days.
 
 ---
 
@@ -262,6 +284,9 @@ docker run -p 8000:8000 -e JWT_SECRET=$(openssl rand -hex 32) agent-orchestrator
 | GET | /runs/{id}/events | JWT or `?token=` | SSE (backlog + live) |
 | GET | /slack/status | JWT | Per-user `{connected, active_agent_id}` |
 | POST | /slack/connect, /slack/active, /slack/disconnect | JWT | Single-owner platform bot |
+| GET | /whatsapp/status | JWT | `{connected, active_agent_id, webhook_url, from_number}` |
+| POST | /whatsapp/connect, /whatsapp/active, /whatsapp/disconnect | JWT | Per-user Twilio creds (multi-user) |
+| POST | /whatsapp/webhook | — | Twilio inbound (public, signature-validated) |
 | GET | /health | — | `{"status": "ok"}` |
 
 ---
@@ -275,6 +300,7 @@ docker run -p 8000:8000 -e JWT_SECRET=$(openssl rand -hex 32) agent-orchestrator
 - **No Alembic in v1.** `create_all()` + Inspector-driven additive migrations (no startup ERROR logs).
 - **Draft → Deployed is explicit.** No auto re-Draft on edit; deploy validates and sets `deployed_at` once.
 - **Single-owner platform Slack bot.** `POST /slack/connect` clears any prior user's tokens before saving yours. Per-user `/slack/status` so new users see "Connect", not "Connected".
+- **Per-user WhatsApp (multi-user concurrent).** Each user connects their own Twilio account; the single `/whatsapp/webhook` routes by `AccountSid` in the POST body. External contacts → pipeline owner's bot. Signature validation uses the user's `webhook_base_url` (not `request.url`) for proxy compatibility. Background `asyncio.create_task` returns empty TwiML within Twilio's 15s timeout; reply sent async via REST.
 - **404 not 403 on cross-user reads.** No existence leak.
 - **SSE dual auth.** EventSource can't send headers → `?token=` accepted alongside `Authorization: Bearer`.
 - **Tool credentials never echo back.** `validate` returns generic errors, logs only exception class.
@@ -289,7 +315,7 @@ Ordered by likely sequence.
 - [ ] **Subscription tier with server-side LLM defaults.** Free = BYOK (current). Paid = backend-managed key pool, no user setup. The free/paid flag already exists on `UserDB.plan`.
 - [ ] **Swarm-style collaboration.** Peer-to-peer agent handoff (not just supervisor → sub). Complements the current hierarchy.
 - [ ] **Scheduled runs.** Cron-style triggers — fire a pipeline on a schedule, post output to Slack / web / webhook.
-- [ ] **WhatsApp integration.** Second messaging channel alongside Slack (Twilio or Meta Cloud API).
+- [x] **WhatsApp integration.** Per-user Twilio WhatsApp — webhook-based, multi-user concurrent, external contacts route to pipeline owner's bot.
 - [ ] **Open-source pipeline catalogue.** Browse + import community pipelines (similar to GPT Store / Replit templates, but pipelines and skills).
 - [ ] **Planner-decider node.** A router in front of the supervisor that classifies queries before dispatching.
 - [ ] **Streaming tokens.** SSE already streams events; pipe per-token deltas to the UI for faster perceived latency.
@@ -302,10 +328,10 @@ Ordered by likely sequence.
 ## Tests
 
 ```bash
-cd backend && make test   # 66 tests
+cd backend && make test   # 73 tests
 ```
 
-Unit + integration: auth, agent CRUD with sub-agent tree validation (cycle / depth / cross-user / tool-name collision), Draft-rejection gating, persona/skill globals + ownership, tool-config validation flow, MCP discovery, chat + run lifecycle, Slack inbound dispatch, memory rolling summary, multimodal file handling, sub-agent recursive build, **live LLM end-to-end** (skipped without creds).
+Unit + integration: auth, agent CRUD with sub-agent tree validation (cycle / depth / cross-user / tool-name collision), Draft-rejection gating, persona/skill globals + ownership, tool-config validation flow, MCP discovery, chat + run lifecycle, Slack inbound dispatch, WhatsApp webhook dispatch (routing, chat reuse, dedup), memory rolling summary, multimodal file handling, sub-agent recursive build, **live LLM end-to-end** (skipped without creds).
 
 Frontend: `npx tsc --noEmit` clean. Backend: `ruff check` clean.
 

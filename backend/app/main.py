@@ -19,6 +19,7 @@ from app.api.providers import router as providers_router
 from app.api.runs import router as runs_router
 from app.api.skills import router as skills_router
 from app.api.slack import router as slack_router
+from app.api.whatsapp import router as whatsapp_router
 from app.api.tool_configs import router as tool_configs_router
 from app.config import get_settings
 from app.db import create_all, seed_defaults
@@ -84,6 +85,11 @@ async def lifespan(app: FastAPI):
         app.state.slack = SlackAdapter(_slack_bot, _slack_app)
         app.state.slack_task = asyncio.create_task(app.state.slack.start())
 
+    # WhatsApp — pre-warm adapter cache for all users with saved Twilio creds.
+    # No persistent connection needed (webhook-based, stateless).
+    from app.api.whatsapp import warm_adapters_from_db
+    await warm_adapters_from_db()
+
     try:
         yield
     finally:
@@ -147,6 +153,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(agents_router)
     app.include_router(slack_router)
+    app.include_router(whatsapp_router)
     app.include_router(personas_router)
     app.include_router(providers_router)
     app.include_router(skills_router)

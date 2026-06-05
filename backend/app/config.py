@@ -37,6 +37,15 @@ class Settings(BaseSettings):
     slack_bot_token: str | None = None  # xoxb- or xoxe- (bot user / access token)
     slack_app_token: str | None = None  # xapp- (Socket Mode app-level token)
 
+    # Twilio WhatsApp — per-user credentials (env vars are optional bootstrap).
+    twilio_account_sid: str | None = None
+    twilio_auth_token: str | None = None
+    twilio_whatsapp_from: str | None = None  # "whatsapp:+14155238886"
+
+    # Public base URL of this server. Used to compute webhook URLs.
+    # Overridden per-user via webhook_base_url on UserDB after first deploy.
+    base_url: str = "http://localhost:8000"
+
 
 @lru_cache
 def get_settings() -> Settings:

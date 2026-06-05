@@ -67,7 +67,7 @@ class Limits(_Base):
 
 
 class ChannelBinding(_Base):
-    channel: Literal["slack", "web"]
+    channel: Literal["slack", "web", "whatsapp"]
     external_id: str | None = None  # e.g., slack channel id
 
 

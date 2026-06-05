@@ -24,6 +24,12 @@ class UserDB(SQLAlchemyBaseUserTableUUID, Base):
     # Per-user Slack bot tokens; first user to connect becomes the platform Slack bot
     slack_bot_token: Mapped[str | None] = mapped_column(String(200), nullable=True)
     slack_app_token: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Per-user Twilio WhatsApp credentials (multi-user concurrent, unlike Slack)
+    whatsapp_account_sid: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    whatsapp_auth_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    whatsapp_from_number: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # Public base URL for webhook signature validation; set after first deploy
+    webhook_base_url: Mapped[str | None] = mapped_column(String(300), nullable=True)
 
 
 class AgentDB(Base):

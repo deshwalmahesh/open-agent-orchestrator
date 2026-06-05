@@ -61,6 +61,10 @@ async def create_all() -> None:
                 ("plan", "VARCHAR(20) NOT NULL DEFAULT 'free'"),
                 ("slack_bot_token", "VARCHAR(200)"),
                 ("slack_app_token", "VARCHAR(200)"),
+                ("whatsapp_account_sid", "VARCHAR(64)"),
+                ("whatsapp_auth_token", "VARCHAR(64)"),
+                ("whatsapp_from_number", "VARCHAR(30)"),
+                ("webhook_base_url", "VARCHAR(300)"),
             ],
             "agents": [("deployed_at", "TIMESTAMP WITH TIME ZONE")],
         }

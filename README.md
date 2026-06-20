@@ -349,8 +349,12 @@ docker run -p 8000:8000 -e JWT_SECRET=$(openssl rand -hex 32) agent-orchestrator
 | GET/POST/PATCH/DELETE | /chats | JWT | PATCH reassigns to a Deployed pipeline only |
 | POST | /chats/{id}/messages | JWT | Schedule a run; accepts file attachments |
 | GET | /chats/{id}/messages | JWT | History |
-| GET | /runs/{id} | JWT | Status + tokens + cost |
+| GET | /runs/{id} | JWT | Status + tokens + cost + tool_calls |
 | GET | /runs/{id}/events | JWT or `?token=` | SSE (backlog + live) |
+| POST | /runs/{id}/feedback | JWT | Thumbs up/down (+ comment); mirrors to Langfuse score |
+| GET | /stats | JWT | Per-user usage: runs, reviews, thumbs, top tools |
+| GET | /metrics/queue-depth | — | arq backlog (ZCARD) for KEDA autoscaling |
+| GET | /health/ready | — | Readiness: Redis ping + DB SELECT 1 (503 if degraded) |
 | GET | /slack/status | JWT | Per-user `{connected, active_agent_id}` |
 | POST | /slack/connect, /slack/active, /slack/disconnect | JWT | Single-owner platform bot |
 | GET | /whatsapp/status | JWT | `{connected, active_agent_id, webhook_url, from_number}` |
@@ -408,16 +412,15 @@ Frontend: `npx tsc --noEmit` clean. Backend: `ruff check` + `bandit` + `pip-audi
 
 ---
 
-## Langfuse (optional)
+## Observability & metrics
 
-```bash
-pip install langfuse
-export LANGFUSE_PUBLIC_KEY=pk-...
-export LANGFUSE_SECRET_KEY=sk-...
-```
+**Two planes, by design** (off-the-shelf for observability, our DB for the product):
 
-```python
-# run_service._execute → invoke config:
-from langfuse.langchain import CallbackHandler
-config={"callbacks": [CallbackHandler()], "recursion_limit": ...}
-```
+- **Langfuse (optional, off-the-shelf tracing).** Set `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` (+ `LANGFUSE_HOST`) and every run is traced — tool calls (**including MCP tools**, since they're standard LangChain tools), token usage, latency, and nested sub-agent spans — via the drop-in `CallbackHandler`. No tracing is hand-rolled. Unset = disabled (no-op), so dev/tests need nothing. Each run uses a deterministic Langfuse trace id derived from `run_id` so feedback attaches to the right trace.
+
+- **In-app metrics (our DB, the product/billing data plane).**
+  - **Feedback:** `POST /runs/{id}/feedback` `{rating: up|down, comment?}` — thumbs up/down, one per (user, run). Stored in `FeedbackDB` (source of truth) and **mirrored to a Langfuse BOOLEAN score** (`user-thumbs`) when Langfuse is on.
+  - **Usage:** a single `UsageCounter` callback (one integration point, not per-tool decorators) counts every tool/sub-agent/MCP call per run into `RunDB.tool_calls`.
+  - **Stats:** `GET /stats` → `{questions_asked, reviews_given, thumbs_up, thumbs_down, top_tools}` per user — the foundation for a usage dashboard / billing.
+
+This is a minimal foundation, intended to extend (time ranges, charts, per-tool cost). New Relic APM (auto-instrumentation, zero hand-written metrics) is the planned ops-metrics layer.

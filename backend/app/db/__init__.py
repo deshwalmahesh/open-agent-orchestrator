@@ -90,7 +90,7 @@ async def create_all() -> None:
                 ("webhook_base_url", "VARCHAR(300)"),
             ],
             "agents": [("deployed_at", "TIMESTAMP WITH TIME ZONE")],
-            "runs": [("error_code", "VARCHAR(40)")],
+            "runs": [("error_code", "VARCHAR(40)"), ("tool_calls", "JSON DEFAULT '{}'")],
         }
         for table, cols in adds.items():
             existing = await conn.run_sync(lambda sc, t=table: _cols(sc, t))

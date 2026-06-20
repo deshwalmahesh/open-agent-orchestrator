@@ -6,7 +6,7 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 from fastapi_users_db_sqlalchemy import SQLAlchemyBaseUserTableUUID
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text, Uuid
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -140,6 +140,9 @@ class RunDB(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Stable machine code from app.errors (e.g. RATE_LIMITED). NULL on success.
     error_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # Per-run tool/sub-agent call counts, e.g. {"web_search": 3, "ResearchBot": 1}.
+    # Populated by the UsageCounter callback; aggregated per-user for usage stats.
+    tool_calls: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class MessageDB(Base):
@@ -166,3 +169,18 @@ class RunEventDB(Base):
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     type: Mapped[str] = mapped_column(String(40), index=True)
     data: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class FeedbackDB(Base):
+    """User thumbs up/down on a run, with an optional comment. One row per (user, run)
+    — re-submitting updates it. Minimal foundation for the metrics dashboard."""
+
+    __tablename__ = "feedback"
+    __table_args__ = (UniqueConstraint("user_id", "run_id", name="uq_feedback_user_run"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("user.id", ondelete="CASCADE"), index=True)
+    run_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("runs.id", ondelete="CASCADE"), index=True)
+    rating: Mapped[str] = mapped_column(String(4))  # "up" | "down"
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

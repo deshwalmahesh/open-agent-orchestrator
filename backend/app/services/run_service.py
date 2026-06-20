@@ -39,10 +39,12 @@ from app.db.repos import (
 from app.domain import AgentConfig, LLMConfig, utcnow
 from app.errors import INTERRUPTED, RUN_TIMEOUT, STEP_LIMIT, classify, info_for
 from app.llm import build_chat_model, invoke_with_breaker
+from app.observability import get_handler, run_span
 from app.plans import limits_for
 from app.runtime.agent import _SUBAGENT_USAGE, _accumulate_usage, build_agent_tree
 from app.runtime.events import EMITTERS, RunEventEmitter
 from app.runtime.tools import build_registry
+from app.runtime.usage_callback import UsageCounter
 
 log = structlog.get_logger()
 
@@ -243,6 +245,7 @@ async def _execute(run_id: UUID, chat_id: UUID, user_text: str, files: list[dict
             # sender_id captured here so we don't touch chat.agent_id after session close
             # (scalar columns survive close because expire_on_commit=False, but explicit is safer)
             sender_id = str(chat.agent_id)
+            user_id = str(chat.user_id)  # for Langfuse trace attribution
 
             file_text, image_blocks = _process_files(files or [])
             full_user_text = f"{file_text}\n\n{user_text}".strip() if file_text else user_text
@@ -279,22 +282,33 @@ async def _execute(run_id: UUID, chat_id: UUID, user_text: str, files: list[dict
         # result["messages"] only sees ToolMessages for sub-agent calls, no usage).
         sub_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         usage_token = _SUBAGENT_USAGE.set(sub_usage)
+        usage_counter = UsageCounter()  # standardized tool/sub-agent call capture (incl MCP)
+        lf_handler = get_handler()      # off-the-shelf Langfuse tracing (None if disabled)
+        callbacks = [usage_counter] + ([lf_handler] if lf_handler else [])
         try:
             # Per-run wall-clock cap OUTSIDE the retry, so a hung multi-step loop or
             # stuck tool can't pin a worker (queue) or leak forever (inline). arq's
-            # job_timeout only covers queue mode; this covers both.
+            # job_timeout only covers queue mode; this covers both. run_span pins the
+            # Langfuse trace id to the run (nullcontext when Langfuse is off).
             async with asyncio.timeout(get_settings().run_timeout_s):
-                result = await invoke_with_breaker(
-                    agent,
-                    {"messages": lc_messages},
-                    config={
-                        "recursion_limit": max(2, cfg.limits.max_steps),
-                        "configurable": {"thread_id": str(run_id)},
-                    },
-                    # Breaker keyed by root provider endpoint (sub-agents may differ;
-                    # the common case is one provider per run).
-                    breaker_key=f"{cfg.llm.provider}:{cfg.llm.base_url}",
-                )
+                with run_span(run_id):
+                    result = await invoke_with_breaker(
+                        agent,
+                        {"messages": lc_messages},
+                        config={
+                            "recursion_limit": max(2, cfg.limits.max_steps),
+                            "configurable": {"thread_id": str(run_id)},
+                            "callbacks": callbacks,  # one slot: usage counter + Langfuse
+                            "metadata": {
+                                "langfuse_user_id": user_id,
+                                "langfuse_session_id": str(chat_id),
+                                "langfuse_tags": [cfg.llm.provider, get_settings().app_env],
+                            },
+                        },
+                        # Breaker keyed by root provider endpoint (sub-agents may differ;
+                        # the common case is one provider per run).
+                        breaker_key=f"{cfg.llm.provider}:{cfg.llm.base_url}",
+                    )
         finally:
             _SUBAGENT_USAGE.reset(usage_token)
 
@@ -315,7 +329,8 @@ async def _execute(run_id: UUID, chat_id: UUID, user_text: str, files: list[dict
                 content=reply,
             )
             await finalize_run(
-                session, run_id=run_id, status="succeeded", total_tokens=usage
+                session, run_id=run_id, status="succeeded", total_tokens=usage,
+                tool_calls=usage_counter.tool_calls,
             )
 
         await emitter.emit("agent.message", {"sender": sender_id, "content": reply})

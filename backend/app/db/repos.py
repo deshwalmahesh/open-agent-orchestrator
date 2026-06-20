@@ -10,7 +10,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
-    AgentDB, ChatDB, MCPServerDB, MessageDB, PersonaDB, RunDB,
+    AgentDB, ChatDB, FeedbackDB, MCPServerDB, MessageDB, PersonaDB, RunDB,
     RunEventDB, SkillDB, UserToolConfigDB,
 )
 from app.domain import utcnow
@@ -343,6 +343,7 @@ async def finalize_run(
     total_cost: float = 0.0,
     error: str | None = None,
     error_code: str | None = None,
+    tool_calls: dict | None = None,
 ) -> None:
     row = await session.get(RunDB, run_id)
     if row is None:
@@ -351,6 +352,8 @@ async def finalize_run(
     row.ended_at = utcnow()
     if total_tokens is not None:
         row.total_tokens = total_tokens
+    if tool_calls is not None:
+        row.tool_calls = tool_calls
     row.total_cost = total_cost
     row.error = error
     row.error_code = error_code
@@ -415,3 +418,59 @@ async def list_events(
         .order_by(RunEventDB.seq)
     )
     return list((await session.execute(stmt)).scalars().all())
+
+
+# ---- Feedback + usage stats (Phase 5d) -----------------------------------
+
+async def upsert_feedback(
+    session: AsyncSession, *, user_id: UUID, run_id: UUID, rating: str, comment: str | None
+) -> FeedbackDB:
+    """One feedback per (user, run) — re-submitting updates the existing row."""
+    row = (await session.execute(
+        select(FeedbackDB).where(
+            FeedbackDB.user_id == user_id, FeedbackDB.run_id == run_id
+        )
+    )).scalar_one_or_none()
+    if row is None:
+        row = FeedbackDB(user_id=user_id, run_id=run_id, rating=rating, comment=comment)
+        session.add(row)
+    else:
+        row.rating, row.comment = rating, comment
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def get_user_stats(session: AsyncSession, *, user_id: UUID) -> dict:
+    """Per-user metrics for the dashboard: runs, reviews, thumbs, and tool/sub-agent
+    usage. tool_calls are summed in Python (portable across SQLite/Postgres JSON)."""
+    questions = (await session.execute(
+        select(func.count()).select_from(RunDB)
+        .join(ChatDB, ChatDB.id == RunDB.chat_id)
+        .where(ChatDB.user_id == user_id)
+    )).scalar_one()
+
+    rating_rows = (await session.execute(
+        select(FeedbackDB.rating, func.count())
+        .where(FeedbackDB.user_id == user_id)
+        .group_by(FeedbackDB.rating)
+    )).all()
+    ratings = {r: c for r, c in rating_rows}
+
+    tool_rows = (await session.execute(
+        select(RunDB.tool_calls)
+        .join(ChatDB, ChatDB.id == RunDB.chat_id)
+        .where(ChatDB.user_id == user_id)
+    )).scalars().all()
+    top_tools: dict[str, int] = {}
+    for calls in tool_rows:
+        for name, n in (calls or {}).items():
+            top_tools[name] = top_tools.get(name, 0) + n
+
+    return {
+        "questions_asked": questions,
+        "reviews_given": ratings.get("up", 0) + ratings.get("down", 0),
+        "thumbs_up": ratings.get("up", 0),
+        "thumbs_down": ratings.get("down", 0),
+        "top_tools": dict(sorted(top_tools.items(), key=lambda kv: kv[1], reverse=True)),
+    }

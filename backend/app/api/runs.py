@@ -8,17 +8,19 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi_users_db_sqlalchemy import SQLAlchemyUserDatabase
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
 from app.db import get_async_session
 from app.db.models import UserDB
-from app.db.repos import get_run, list_events
+from app.db.repos import get_run, list_events, upsert_feedback
+from app.observability import record_score
 from app.redis_client import get_redis
 from app.runtime.events import EMITTERS, run_channel
 from app.users import UserManager, current_active_user, get_jwt_strategy
@@ -144,4 +146,29 @@ async def get_one(
         "total_cost": row.total_cost,
         "error": row.error,
         "error_code": row.error_code,
+        "tool_calls": row.tool_calls,
     }
+
+
+class FeedbackBody(BaseModel):
+    rating: Literal["up", "down"]
+    comment: str | None = None
+
+
+@router.post("/{run_id}/feedback", status_code=status.HTTP_201_CREATED)
+async def submit_feedback(
+    run_id: UUID,
+    body: FeedbackBody,
+    user: Annotated[UserDB, Depends(current_active_user)],
+    session: Annotated[AsyncSession, Depends(get_async_session)],
+) -> dict:
+    """Thumbs up/down (+ optional comment) on a run. Owner-checked; one per (user, run)."""
+    if await get_run(session, run_id=run_id, user_id=user.id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
+    row = await upsert_feedback(
+        session, user_id=user.id, run_id=run_id, rating=body.rating, comment=body.comment
+    )
+    # Mirror to a Langfuse score (best-effort; DB row above is the source of truth).
+    record_score(run_id, name="user-thumbs", value=1 if body.rating == "up" else 0,
+                 comment=body.comment)
+    return {"id": str(row.id), "rating": row.rating}

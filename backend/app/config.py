@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     # Web search (tool auto-disables if unset)
     tavily_api_key: str | None = None
 
+    # Langfuse (optional, off-the-shelf LLM tracing). All three unset = disabled (no-op).
+    # The SDK reads these same names from env directly; we mirror them here for the
+    # enabled-check and to keep config in one place.
+    langfuse_public_key: str | None = None
+    langfuse_secret_key: str | None = None
+    langfuse_host: str = "https://cloud.langfuse.com"
+
     # LangGraph checkpointer (ephemeral session/thread state)
     redis_url: str = "redis://localhost:6379/0"
     redis_ttl_seconds: int = 60 * 60 * 24 * 30  # 30d idle threads expire

@@ -18,6 +18,7 @@ from app.api.personas import router as personas_router
 from app.api.providers import router as providers_router
 from app.api.runs import router as runs_router
 from app.api.skills import router as skills_router
+from app.api.stats import router as stats_router
 from app.api.slack import router as slack_router
 from app.api.whatsapp import router as whatsapp_router
 from app.api.tool_configs import router as tool_configs_router
@@ -235,6 +236,7 @@ def create_app() -> FastAPI:
     app.include_router(tool_configs_router)
     app.include_router(chats_router)
     app.include_router(runs_router)
+    app.include_router(stats_router)
 
     # Serve built frontend in prod (Dockerfile copies dist → /app/static).
     # Mounted AFTER API routes so they always win. SPA fallback: unknown paths

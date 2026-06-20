@@ -726,7 +726,6 @@ dependencies = [
     { name = "pypdf" },
     { name = "pyyaml" },
     { name = "slack-bolt" },
-    { name = "slack-sdk" },
     { name = "slowapi" },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "sse-starlette" },
@@ -738,7 +737,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
@@ -768,7 +766,6 @@ requires-dist = [
     { name = "pypdf", specifier = ">=6.12.2" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "slack-bolt", specifier = ">=1.28.0" },
-    { name = "slack-sdk", specifier = ">=3.42.0" },
     { name = "slowapi", specifier = ">=0.1.9" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.36" },
     { name = "sse-starlette", specifier = ">=3.4.4" },
@@ -780,7 +777,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx", specifier = ">=0.28.1" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
     { name = "ruff", specifier = ">=0.15.15" },

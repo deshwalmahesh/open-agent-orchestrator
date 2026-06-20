@@ -23,7 +23,6 @@ dependencies = [
     "pypdf>=6.12.2",
     "pyyaml>=6.0.3",
     "slack-bolt>=1.28.0",
-    "slack-sdk>=3.42.0",
     "slowapi>=0.1.9",
     "twilio>=9.0.0",
     "sqlalchemy[asyncio]>=2.0.36",
@@ -37,7 +36,6 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.15.15",

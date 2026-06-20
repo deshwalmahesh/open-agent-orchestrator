@@ -1,0 +1,28 @@
+# Local preflight: fail fast in seconds before pushing. Install once: `pre-commit install`.
+# CI runs the same hooks (`pre-commit run --all-files`) so local and CI never diverge.
+exclude: '^deploy/helm/.*/templates/'   # Helm Go-templates aren't valid YAML
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.5
+    hooks:
+      - id: ruff            # lint (matches CI `ruff check`)
+        args: [--fix]
+        files: ^backend/
+      # ruff-format intentionally omitted: the existing code predates it (59/70 files
+      # would churn). Lint is the correctness gate; formatting is left to the author.
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks        # secret scanning — critical for BYOK (no committed API keys/JWT)
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1024]

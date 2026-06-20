@@ -38,6 +38,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://agent:agent@postgres:5432/agent
       REDIS_URL: redis://redis:6379/0
+      RUN_EXECUTOR: queue   # API enqueues runs; the `worker` service executes them
     ports:
       - "8000:8000"
     volumes:
@@ -55,6 +56,29 @@ services:
       timeout: 3s
       retries: 5
       start_period: 15s
+
+  # Durable run executor. Same image as backend, different command. Scale with
+  # `docker compose up --scale worker=N` — arq workers share the Redis queue.
+  worker:
+    build:
+      context: ./backend
+    container_name: ca-worker
+    command: ["sh", "-c", "uv sync && uv run arq app.worker.WorkerSettings"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://agent:agent@postgres:5432/agent
+      REDIS_URL: redis://redis:6379/0
+      RUN_EXECUTOR: queue
+    volumes:
+      - ./backend:/app
+      - /app/.venv
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
   mcp-sample:
     build:

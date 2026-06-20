@@ -17,11 +17,29 @@ def _isolated_db(monkeypatch, tmp_path):
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
     # ≥32 bytes so HMAC-SHA256 doesn't emit InsecureKeyLengthWarning during tests.
     monkeypatch.setenv("JWT_SECRET", "test-secret-32-bytes-long-for-hmac-sha256")
+    # Dedicated Redis DB (15) so tests never touch dev data (db 0), and flush it so
+    # cross-test state (dedup keys, leader locks, pub/sub) can't leak between tests.
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/15")
     get_settings.cache_clear()
 
     import app.db as db_module
     db_module._engine = None
     db_module._session_factory = None
+
+    import app.redis_client as redis_module
+    redis_module._redis = None
+
+    # Disable the slowapi IP rate limiter in tests — its in-memory counter is a
+    # module global that accumulates across the whole suite (120+ /auth/register
+    # calls from one test-client IP would trip 60/min). Not under test here.
+    from app.main import limiter
+    limiter.enabled = False
+
+    try:
+        import redis
+        redis.Redis.from_url("redis://localhost:6379/15").flushdb()
+    except Exception:
+        pass  # no Redis reachable → gated tests skip anyway
 
     yield
     get_settings.cache_clear()

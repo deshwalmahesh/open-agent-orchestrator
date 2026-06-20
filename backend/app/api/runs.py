@@ -19,7 +19,8 @@ from sse_starlette.sse import EventSourceResponse
 from app.db import get_async_session
 from app.db.models import UserDB
 from app.db.repos import get_run, list_events
-from app.runtime.events import EMITTERS
+from app.redis_client import get_redis
+from app.runtime.events import EMITTERS, run_channel
 from app.users import UserManager, current_active_user, get_jwt_strategy
 
 router = APIRouter(prefix="/runs", tags=["runs"])
@@ -63,29 +64,62 @@ async def stream_events(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
 
     async def gen():
-        # Backlog from durable store.
+        # 1) Durable backlog (works regardless of which process ran the job).
         backlog = await list_events(session, run_id=run_id, after_seq=after_seq)
         last_seq = after_seq
         for ev in backlog:
             yield _serialize(ev.type, ev.seq, ev.data)
             last_seq = ev.seq
+            if ev.type == "run.finished":
+                return  # already terminal — nothing live to wait for
 
-        # Live drain — only if the run is still in-flight.
+        # 2a) Same-process live drain (inline mode): the emitter is in THIS process.
         emitter = EMITTERS.get(run_id)
-        if emitter is None:
+        if emitter is not None:
+            while True:
+                try:
+                    ev = await asyncio.wait_for(emitter.queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    yield {"event": "ping", "data": "{}"}
+                    continue
+                if ev is None:  # sentinel — run finished
+                    return
+                if ev.seq <= last_seq:  # backlog already covered this
+                    continue
+                yield _serialize(ev.type, ev.seq, ev.data)
+                last_seq = ev.seq
             return
-        while True:
-            try:
-                ev = await asyncio.wait_for(emitter.queue.get(), timeout=30.0)
-            except asyncio.TimeoutError:
-                yield {"event": "ping", "data": "{}"}
-                continue
-            if ev is None:  # sentinel — run finished
-                return
-            if ev.seq <= last_seq:  # backlog already covered this
-                continue
-            yield _serialize(ev.type, ev.seq, ev.data)
-            last_seq = ev.seq
+
+        # 2b) Cross-process live drain (queue mode): the run executes in a worker, so
+        # subscribe to its Redis channel. If Redis is unreachable and the run isn't
+        # local, there's nothing to stream live — backlog already flushed, so return.
+        try:
+            pubsub = get_redis().pubsub()
+            await pubsub.subscribe(run_channel(run_id))
+        except Exception:
+            return
+        try:
+            # Catch-up: events written between the backlog read and subscribe would
+            # otherwise be missed (and a finished run would hang the stream).
+            for ev in await list_events(session, run_id=run_id, after_seq=last_seq):
+                yield _serialize(ev.type, ev.seq, ev.data)
+                last_seq = ev.seq
+                if ev.type == "run.finished":
+                    return
+            while True:
+                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=30.0)
+                if msg is None:
+                    yield {"event": "ping", "data": "{}"}
+                    continue
+                d = json.loads(msg["data"])
+                if d["seq"] <= last_seq:
+                    continue
+                yield _serialize(d["type"], d["seq"], d["data"])
+                last_seq = d["seq"]
+                if d["type"] == "run.finished":
+                    return
+        finally:
+            await pubsub.aclose()
 
     return EventSourceResponse(gen())
 
@@ -109,4 +143,5 @@ async def get_one(
         "total_tokens": row.total_tokens,
         "total_cost": row.total_cost,
         "error": row.error,
+        "error_code": row.error_code,
     }

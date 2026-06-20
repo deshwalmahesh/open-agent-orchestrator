@@ -51,4 +51,4 @@ if __name__ == "__main__":
         "[sample-mcp] another container, use http://mcp-sample:8001/mcp (NOT 0.0.0.0/localhost).",
         flush=True,
     )
-    mcp.run(transport="http", host="0.0.0.0", port=8001)
+    mcp.run(transport="http", host="0.0.0.0", port=8001)  # nosec B104 — sample server binds all interfaces inside its container by design

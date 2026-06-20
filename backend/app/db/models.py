@@ -131,12 +131,15 @@ class RunDB(Base):
     agent_id: Mapped[UUID | None] = mapped_column(
         Uuid, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True
     )
-    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    # Lifecycle: queued → running → succeeded | failed
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     total_tokens: Mapped[dict] = mapped_column(JSON, default=dict)
     total_cost: Mapped[float] = mapped_column(Float, default=0.0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Stable machine code from app.errors (e.g. RATE_LIMITED). NULL on success.
+    error_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
 
 class MessageDB(Base):

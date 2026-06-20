@@ -114,3 +114,70 @@ def test_all_endpoints_require_auth(client):
     ]:
         r = client.request(method, path, json={"agent_id": str(uuid4())} if method == "POST" else None)
         assert r.status_code == 401, f"{method} {path} -> {r.status_code}"
+
+
+# --- 3d: attachment limits (pure boundary check, no DB needed) ---
+
+def _att(n_b64_chars: int):
+    from app.api.chats import FileAttachment
+    return FileAttachment(name="f", content_base64="A" * n_b64_chars, mime_type="text/plain")
+
+
+def test_attachments_within_limits_ok():
+    from app.api.chats import _check_attachments
+    _check_attachments([_att(100)])  # 1 small file → fine
+
+
+def test_attachments_too_many_files_413():
+    import pytest
+    from fastapi import HTTPException
+
+    from app.api.chats import _check_attachments
+    with pytest.raises(HTTPException) as e:
+        _check_attachments([_att(10) for _ in range(6)])  # default cap is 5
+    assert e.value.status_code == 413
+
+
+def test_attachments_too_large_413():
+    import pytest
+    from fastapi import HTTPException
+
+    from app.api.chats import _check_attachments
+    # base64 len * 3/4 must exceed 10 MB → need ~14 MB of base64.
+    with pytest.raises(HTTPException) as e:
+        _check_attachments([_att(15 * 1024 * 1024)])
+    assert e.value.status_code == 413
+
+
+# --- HTTP-boundary tests for the new reject paths (router wiring, not just the fn) ---
+
+def _make_deployed_chat(client, token, auth_header, sample_agent_config) -> str:
+    agent_id = _create_agent(client, token, auth_header, sample_agent_config)
+    r = client.post("/chats", json={"agent_id": agent_id}, headers=auth_header(token))
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def test_post_message_413_when_too_many_files(client, signup_and_login, auth_header, sample_agent_config):
+    token = signup_and_login()
+    chat_id = _make_deployed_chat(client, token, auth_header, sample_agent_config)
+    files = [{"name": f"f{i}", "content_base64": "AAAA", "mime_type": "text/plain"} for i in range(6)]
+    r = client.post(f"/chats/{chat_id}/messages", json={"text": "hi", "files": files},
+                    headers=auth_header(token))
+    assert r.status_code == 413, r.text
+
+
+def test_post_message_429_when_at_concurrency_cap(client, signup_and_login, auth_header,
+                                                  sample_agent_config, monkeypatch):
+    """Free plan cap = 1. Stub the active-run count over the cap → POST returns 429.
+    (Stubbing the count avoids racing the inline executor, which finishes runs fast.)"""
+    token = signup_and_login()
+    chat_id = _make_deployed_chat(client, token, auth_header, sample_agent_config)
+
+    async def _fake_count(session, *, user_id):
+        return 99  # already way over the free cap of 1
+    monkeypatch.setattr("app.services.run_service.count_active_runs", _fake_count)
+
+    r = client.post(f"/chats/{chat_id}/messages", json={"text": "hi"}, headers=auth_header(token))
+    assert r.status_code == 429, r.text
+    assert "in progress" in r.json()["detail"].lower()

@@ -8,8 +8,9 @@ import structlog
 import yaml
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 
 log = structlog.get_logger()
 
@@ -22,10 +23,32 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
+def _build_engine(url: str, s: Settings) -> AsyncEngine:
+    """Create the async engine with pool tuning. SQLite (file/single-writer) ignores
+    pool args. Postgres gets an env-tuned QueuePool, or NullPool when fronted by
+    PgBouncer (the proxy owns pooling; asyncpg also needs its statement cache off)."""
+    kwargs: dict = {"future": True}
+    if not url.startswith("sqlite"):
+        if s.db_use_null_pool:
+            kwargs["poolclass"] = NullPool
+            if "asyncpg" in url:  # PgBouncer transaction mode breaks server-side prepared stmts
+                kwargs["connect_args"] = {"statement_cache_size": 0}
+        else:
+            kwargs.update(
+                pool_size=s.db_pool_size,
+                max_overflow=s.db_max_overflow,
+                pool_timeout=s.db_pool_timeout,
+                pool_recycle=s.db_pool_recycle,
+                pool_pre_ping=s.db_pool_pre_ping,
+            )
+    return create_async_engine(url, **kwargs)
+
+
 def get_engine() -> AsyncEngine:
     global _engine
     if _engine is None:
-        _engine = create_async_engine(get_settings().database_url, future=True)
+        s = get_settings()
+        _engine = _build_engine(s.database_url, s)
     return _engine
 
 
@@ -67,6 +90,7 @@ async def create_all() -> None:
                 ("webhook_base_url", "VARCHAR(300)"),
             ],
             "agents": [("deployed_at", "TIMESTAMP WITH TIME ZONE")],
+            "runs": [("error_code", "VARCHAR(40)")],
         }
         for table, cols in adds.items():
             existing = await conn.run_sync(lambda sc, t=table: _cols(sc, t))

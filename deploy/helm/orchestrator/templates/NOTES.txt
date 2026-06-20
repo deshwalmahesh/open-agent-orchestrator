@@ -1,0 +1,20 @@
+{{ include "orchestrator.fullname" . }} deployed.
+
+Components:
+  - api Deployment + Service{{ if .Values.api.hpa.enabled }} + HPA (CPU){{ end }}{{ if .Values.api.ingress.enabled }} + Ingress ({{ .Values.api.ingress.host }}){{ end }}
+  - worker Deployment{{ if .Values.worker.keda.enabled }} + KEDA ScaledObject (autoscales on arq queue depth){{ end }}
+  - migrate Job (pre-install/pre-upgrade hook: schema bootstrap, single pod)
+
+Before this works in prod:
+  1. Set a real image:        --set image.repository=ghcr.io/<owner>/<repo>/backend
+  2. Provide secrets:         DATABASE_URL, REDIS_URL, JWT_SECRET (override CHANGE_ME).
+     Prefer an existing Secret: --set secrets.existingSecret=<name> (base64 ≠ encryption).
+{{- if .Values.worker.keda.enabled }}
+  3. KEDA must be installed in the cluster (https://keda.sh) — the worker ScaledObject
+     needs the keda.sh/v1alpha1 CRDs. Without KEDA, set worker.keda.enabled=false to
+     fall back to a fixed worker.replicaCount.
+{{- end }}
+
+REDIS_URL should point at redis-stack (RediSearch) — the LangGraph checkpointer needs it;
+arq + coordination work on any Redis. Size worker.keda.maxReplicas to your LLM's concurrent
+ceiling — scaling workers beyond that just trades queue wait for provider 429s.

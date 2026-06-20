@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import structlog
 
+from app.config import get_settings
 from app.db import get_async_session
 from app.db.models import AgentDB, MessageDB, UserDB
 from app.db.repos import (
@@ -23,7 +24,8 @@ from app.db.repos import (
     list_messages,
     update_chat,
 )
-from app.services.run_service import start_run
+from app.errors import QUEUE_UNAVAILABLE, info_for
+from app.services.run_service import ConcurrencyLimitExceeded, QueueFull, start_run
 from app.users import current_active_user
 
 log = structlog.get_logger()
@@ -47,6 +49,23 @@ class FileAttachment(BaseModel):
 class MessageBody(BaseModel):
     text: str
     files: list[FileAttachment] = Field(default_factory=list)
+
+
+def _check_attachments(files: list[FileAttachment]) -> None:
+    """Reject oversized uploads with 413 BEFORE base64 is decoded into memory.
+    Decoded size is estimated from base64 length (≈ 3/4) so we never decode to measure."""
+    s = get_settings()
+    if len(files) > s.max_upload_files:
+        raise HTTPException(
+            status.HTTP_413_CONTENT_TOO_LARGE,
+            f"too many files ({len(files)} > {s.max_upload_files})",
+        )
+    est_bytes = sum(len(f.content_base64) for f in files) * 3 // 4
+    if est_bytes > s.max_upload_mb * 1024 * 1024:
+        raise HTTPException(
+            status.HTTP_413_CONTENT_TOO_LARGE,
+            f"attachments too large (>{s.max_upload_mb} MB)",
+        )
 
 
 class ChatPatchBody(BaseModel):
@@ -200,8 +219,22 @@ async def post_message(
             status.HTTP_400_BAD_REQUEST,
             "no agent assigned — use PATCH /chats/{id} to assign one first",
         )
+    _check_attachments(body.files)
     files_raw = [f.model_dump() for f in body.files]
-    run_id = await start_run(session, chat_id=chat_id, user_text=body.text, files=files_raw)
+    try:
+        run_id = await start_run(session, chat_id=chat_id, user_text=body.text, files=files_raw)
+    except ConcurrencyLimitExceeded as exc:
+        # Per-plan fairness cap — tell the user to wait or upgrade.
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            f"You have {exc.active} runs in progress (plan limit {exc.cap}). "
+            "Wait for one to finish or upgrade your plan.",
+        )
+    except QueueFull:
+        # Backlog over cap — fail fast so the client retries instead of waiting forever.
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, info_for(QUEUE_UNAVAILABLE).user_message
+        )
     log.info("chat.message", chat_id=str(chat_id), run_id=str(run_id), user_id=str(user.id))
     return {"run_id": str(run_id), "chat_id": str(chat_id)}
 

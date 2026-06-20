@@ -9,7 +9,6 @@ import asyncio
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
-import pytest
 
 from app.db import get_session_factory
 from app.db.models import UserDB
@@ -224,13 +223,32 @@ def test_webhook_unknown_account_returns_empty_twiml(client):
     assert "<Response>" in resp.text
 
 
-def test_dedup_check_function():
-    """Unit test the dedup function directly — no HTTP involved."""
-    from app.api.whatsapp import _dedup_check, _seen_message_sids
-    _seen_message_sids.clear()
+async def test_dedup_fallback_when_redis_down(monkeypatch):
+    """Redis unreachable → in-process fallback still enforces the dedup contract."""
+    import app.api.whatsapp as wa
+    wa._seen_message_sids.clear()
 
-    assert _dedup_check("SM_FIRST") is False  # new → added
-    assert _dedup_check("SM_FIRST") is True   # seen → duplicate
-    assert _dedup_check("SM_SECOND") is False  # different sid → new
+    def _boom():
+        raise ConnectionError("redis down")
+    monkeypatch.setattr(wa, "get_redis", _boom)
 
-    _seen_message_sids.clear()
+    assert await wa._dedup_check("SM_FIRST") is False   # new
+    assert await wa._dedup_check("SM_FIRST") is True    # duplicate
+    assert await wa._dedup_check("SM_SECOND") is False  # different sid
+    wa._seen_message_sids.clear()
+
+
+async def test_dedup_cross_replica_via_redis():
+    """Redis SET NX dedups across processes; skipped if no reachable Redis."""
+    import pytest
+    import app.api.whatsapp as wa
+    from app.redis_client import get_redis
+    try:
+        await get_redis().ping()
+    except Exception:
+        pytest.skip("no reachable Redis")
+
+    sid = f"SM_{__import__('uuid').uuid4().hex}"
+    await get_redis().delete(f"wa:seen:{sid}")
+    assert await wa._dedup_check(sid) is False  # first time
+    assert await wa._dedup_check(sid) is True   # redis remembers it

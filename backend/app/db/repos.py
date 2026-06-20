@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -301,8 +301,10 @@ async def delete_chat(session: AsyncSession, *, chat_id: UUID, user_id: UUID) ->
 
 # ---- Runs ----------------------------------------------------------------
 
-async def create_run(session: AsyncSession, *, chat_id: UUID, agent_id: UUID) -> RunDB:
-    row = RunDB(chat_id=chat_id, agent_id=agent_id, status="running")
+async def create_run(
+    session: AsyncSession, *, chat_id: UUID, agent_id: UUID, status: str = "queued"
+) -> RunDB:
+    row = RunDB(chat_id=chat_id, agent_id=agent_id, status=status)
     session.add(row)
     await session.commit()
     await session.refresh(row)
@@ -319,6 +321,19 @@ async def get_run(session: AsyncSession, *, run_id: UUID, user_id: UUID) -> RunD
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
+async def count_active_runs(session: AsyncSession, *, user_id: UUID) -> int:
+    """Non-terminal (queued/running) runs for a user — for the per-plan concurrency cap.
+    Counts the DB directly (joined via chat) so it's always correct and self-heals via
+    the reconciler — no separate counter to drift on redelivery/lost jobs."""
+    stmt = (
+        select(func.count())
+        .select_from(RunDB)
+        .join(ChatDB, ChatDB.id == RunDB.chat_id)
+        .where(ChatDB.user_id == user_id, RunDB.status.in_(("queued", "running")))
+    )
+    return (await session.execute(stmt)).scalar_one()
+
+
 async def finalize_run(
     session: AsyncSession,
     *,
@@ -327,6 +342,7 @@ async def finalize_run(
     total_tokens: dict | None = None,
     total_cost: float = 0.0,
     error: str | None = None,
+    error_code: str | None = None,
 ) -> None:
     row = await session.get(RunDB, run_id)
     if row is None:
@@ -337,6 +353,7 @@ async def finalize_run(
         row.total_tokens = total_tokens
     row.total_cost = total_cost
     row.error = error
+    row.error_code = error_code
     await session.commit()
 
 
@@ -358,6 +375,17 @@ async def insert_message(
     await session.commit()
     await session.refresh(row)
     return row
+
+
+async def run_has_user_message(session: AsyncSession, *, run_id: UUID) -> bool:
+    """True if a user message already exists for this run. Used to make _execute
+    idempotent under at-least-once redelivery (a retried job must not double-insert)."""
+    stmt = (
+        select(MessageDB.id)
+        .where(MessageDB.run_id == run_id, MessageDB.sender == "user")
+        .limit(1)
+    )
+    return (await session.execute(stmt)).first() is not None
 
 
 async def list_messages(

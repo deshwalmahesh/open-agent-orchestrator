@@ -1,0 +1,73 @@
+# One image, two run-modes (api / worker) — see backend/Dockerfile.
+image:
+  repository: ghcr.io/OWNER/REPO/backend   # override per deploy (CI pushes this)
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Non-secret config → ConfigMap → envFrom on every pod.
+config:
+  APP_ENV: prod
+  LOG_LEVEL: INFO
+  RUN_EXECUTOR: queue          # API enqueues, workers execute
+  WORKER_MAX_JOBS: "10"        # per-worker concurrency (size to your LLM ceiling)
+  RUN_TIMEOUT_S: "300"
+  RUN_MAX_TRIES: "3"
+  MAX_QUEUE_DEPTH: "1000"      # global load-shed: 503 past this backlog
+  DB_USE_NULL_POOL: "false"    # set true when fronted by PgBouncer
+  DB_POOL_SIZE: "5"
+  DB_MAX_OVERFLOW: "10"
+  LLM_MAX_RETRIES: "2"
+
+# Secrets → Secret → envFrom. Either inline here (dev) or point at an existing
+# Secret (prod: Sealed Secrets / External Secrets / cloud KMS — base64 isn't encryption).
+secrets:
+  existingSecret: ""           # if set, used verbatim and `data` below is ignored
+  data:
+    DATABASE_URL: ""           # postgresql+asyncpg://user:pass@host:5432/db
+    REDIS_URL: ""              # redis://host:6379/0  (redis-stack for the checkpointer)
+    JWT_SECRET: ""             # MUST override — app refuses CHANGE_ME_IN_PROD in prod
+
+# One-shot schema bootstrap before each rollout (Helm pre-install/pre-upgrade hook).
+# Runs as ONE pod so concurrent replicas never race on create_all/seed.
+migrate:
+  enabled: true
+
+api:
+  replicaCount: 2
+  containerPort: 8000
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  service:
+    type: ClusterIP
+    port: 80
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  ingress:
+    enabled: false
+    className: ""
+    host: ""
+    annotations: {}
+    tls: false
+    tlsSecretName: ""
+
+worker:
+  replicaCount: 2              # baseline; KEDA overrides between min/max when enabled
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  # Autoscale on QUEUE DEPTH, not CPU (workers are I/O-bound on the LLM).
+  # arq's queue is a Redis sorted set, so we scale on the app's ZCARD endpoint via
+  # KEDA's metrics-api scaler (not the redis/LLEN scaler, which would read nothing).
+  keda:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 20           # cap at your LLM's concurrent ceiling — more is pointless
+    pollingInterval: 15
+    cooldownPeriod: 120
+    targetDepthPerReplica: "20"   # scale so backlog/replicas ≈ this

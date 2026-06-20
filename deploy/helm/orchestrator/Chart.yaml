@@ -1,0 +1,6 @@
+apiVersion: v2
+name: orchestrator
+description: AI Agent Orchestration Platform — API (HPA) + arq workers (KEDA queue-depth autoscale)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

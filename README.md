@@ -190,6 +190,75 @@ Three boundaries, kept thin:
 
 ---
 
+## Production & scale
+
+The system runs in two modes, set by `RUN_EXECUTOR`:
+
+- **`inline`** (default) — runs execute as `asyncio` tasks in the API process. Zero infra; for dev / single-box.
+- **`queue`** — `POST /chats/{id}/messages` only writes a row + enqueues to **arq** (a Redis task queue), returning `202` in milliseconds. A separate pool of **worker** processes pulls and runs them. This is the production mode.
+
+### The decoupling (why a burst doesn't melt anything)
+
+Accept-work is split from do-work. The API never blocks on an LLM call, so 10k enqueues are cheap Redis ops. The queue is the shock absorber — bursts buffer in Redis, not in process memory. Workers pull at *their* rate; `WORKER_MAX_JOBS` caps concurrent LLM calls per worker so you never push the model past its ceiling (no self-inflicted 429 storm). Past capacity the system **sheds load** (`MAX_QUEUE_DEPTH` → `503`) and enforces **per-plan concurrency caps** (`429`) for fairness, instead of growing latency unbounded.
+
+### Why arq, not Celery + RabbitMQ
+
+You'll see agent stacks reach for Celery+RabbitMQ. RabbitMQ is an **event-streaming/broker** built for complex routing, fan-out to many consumers, and million-msg pipelines; Celery is sync-first and forks worker processes. We need plain **durable request→result task dispatch** on an event loop. `arq` does exactly that — async-native, at-least-once delivery, retries, timeouts, dedup — on the **Redis we already run** for checkpoints. No second broker to operate. (If you later need topic fan-out or multi-language consumers, the queue is the seam to swap.)
+
+### Background processes
+
+- **arq workers** — the run executor (queue mode). Scale independently of the API.
+- **Slack Socket Mode** — a single-consumer protocol, so it runs on **exactly one replica** via a Redis leader lock (`app/leader.py`); a poller fails over if the leader dies.
+- **Startup reconciler** — marks runs left non-terminal by a crash as `failed(INTERRUPTED)` so no waiter hangs forever.
+- **Graceful drain** — lifespan shutdown drains in-flight work and closes pools for clean rolling deploys.
+
+### Horizontal vs vertical scaling
+
+Horizontal is primary: API and workers are **stateless** and share Redis + Postgres, so you add replicas freely (Phase-2 work made SSE, Slack, dedup, and migrations cross-process-safe).
+
+| Tier | Scales on | Mechanism |
+|---|---|---|
+| **API** | CPU / RPS | Kubernetes **HPA** (request-bound: enqueue + SSE) |
+| **Workers** | **queue depth** | **KEDA** ScaledObject → `/metrics/queue-depth` (ZCARD of the arq queue). CPU is meaningless when you're I/O-bound on the LLM. Cap `maxReplicas` at your LLM's concurrent ceiling. |
+
+Vertical = bigger pods or a higher `WORKER_MAX_JOBS`; prefer more pods for resilience. DB connections are bounded by env-tuned pool settings (`DB_POOL_SIZE`/`DB_MAX_OVERFLOW`/…), with a `DB_USE_NULL_POOL` switch to put **PgBouncer** in front when replica count is high.
+
+### Robustness (what happens when something breaks)
+
+Every failure maps to a stable `error_code` + user message + retry policy (`app/errors.py`). LLM calls get **provider-SDK retries** (429/5xx, respects `Retry-After`) + a **tenacity backoff with jitter** + a **circuit breaker** (fails fast as `PROVIDER_UNAVAILABLE` when a provider is hard-down). Runs are **idempotent** (safe under at-least-once redelivery), have a **per-run wall-clock timeout**, and are backstopped by the reconciler. See the full failure taxonomy in `app/errors.py`.
+
+### Security
+
+JWT auth (fastapi-users), per-user/IP rate limiting (Redis-backed in prod), per-plan concurrency caps, attachment size limits (413 before base64 decode), 404-not-403 on cross-user reads, Twilio signature validation, and a **prod fail-fast** that refuses to boot with the default `JWT_SECRET`. BYOK credentials are never held server-side.
+
+### CI/CD (`.github/workflows/ci.yml`)
+
+Fail-fast gates on every PR/push, then build → scan → push:
+
+- **static** — `uv lock --locked` (lockfile drift) + `ruff` lint
+- **security** — **gitleaks** (secret scan, BYOK-critical) + **pip-audit** (dependency CVEs) + **bandit** (Python SAST)
+- **test** — full suite against **real Redis + Postgres** service containers (the queue/leader/pub-sub tests run for real)
+- **helm** — chart lint
+- **build** — Docker build + **Trivy** image scan (fail on HIGH/CRITICAL), push to GHCR on `main`
+
+`.pre-commit-config.yaml` mirrors the static + secret gates locally so you fail in seconds, not after a CI round-trip (`pre-commit install`).
+
+### Deploy to Kubernetes (Helm)
+
+`deploy/helm/orchestrator/` ships api (Deployment + Service + HPA + optional Ingress), worker (Deployment + KEDA ScaledObject), a single-runner **migration Job** (pre-install/upgrade hook — kills the multi-worker `create_all` race), and ConfigMap/Secret. Liveness `/health`, readiness `/health/ready`.
+
+```bash
+helm install mao deploy/helm/orchestrator \
+  --set image.repository=ghcr.io/<owner>/<repo>/backend \
+  --set secrets.data.DATABASE_URL='postgresql+asyncpg://user:pass@host:5432/db' \
+  --set secrets.data.REDIS_URL='redis://host:6379/0' \
+  --set secrets.data.JWT_SECRET="$(openssl rand -hex 32)"
+```
+
+KEDA must be installed for worker autoscaling (`--set worker.keda.enabled=false` to fall back to fixed replicas). Validated end-to-end on a local `kind` cluster (migrate Job → pods Ready → `/health/ready` green).
+
+---
+
 ## Setup
 
 ### Full stack (Docker — recommended)
@@ -328,12 +397,14 @@ Ordered by likely sequence.
 ## Tests
 
 ```bash
-cd backend && make test   # 73 tests
+cd backend && make test   # 129 tests
 ```
 
 Unit + integration: auth, agent CRUD with sub-agent tree validation (cycle / depth / cross-user / tool-name collision), Draft-rejection gating, persona/skill globals + ownership, tool-config validation flow, MCP discovery, chat + run lifecycle, Slack inbound dispatch, WhatsApp webhook dispatch (routing, chat reuse, dedup), memory rolling summary, multimodal file handling, sub-agent recursive build, **live LLM end-to-end** (skipped without creds).
 
-Frontend: `npx tsc --noEmit` clean. Backend: `ruff check` clean.
+Production-hardening coverage: failure taxonomy, run idempotency + crash reconciler, per-run timeout, **arq queue end-to-end** (real worker drains a real Redis queue), cross-process SSE pub/sub, Redis leader lock, LLM retry + circuit breaker, DB pool config, load-shed + concurrency caps (413/429/503 at the HTTP boundary), prod fail-fast. Redis-gated tests run against a real Redis (skipped if none reachable). The Helm chart is validated end-to-end on a local `kind` cluster.
+
+Frontend: `npx tsc --noEmit` clean. Backend: `ruff check` + `bandit` + `pip-audit` + `gitleaks` clean.
 
 ---
 

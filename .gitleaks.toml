@@ -1,0 +1,16 @@
+# gitleaks config. Extends the default ruleset; allowlists known test fixtures so
+# the gate stays useful (real secrets still fail) without false positives.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures (fake credentials) and vendored/ignored dirs"
+regexes = [
+  '''longenoughpwd123''',                          # test login password
+  '''test-secret-32-bytes-long-for-hmac-sha256''', # test JWT secret
+]
+paths = [
+  '''\.venv/''',
+  '''node_modules/''',
+  '''\.env\.example''',
+]

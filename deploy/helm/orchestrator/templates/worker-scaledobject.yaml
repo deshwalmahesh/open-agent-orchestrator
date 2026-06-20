@@ -1,0 +1,24 @@
+{{- if .Values.worker.keda.enabled }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "orchestrator.fullname" . }}-worker
+  labels:
+    {{- include "orchestrator.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ include "orchestrator.fullname" . }}-worker
+  minReplicaCount: {{ .Values.worker.keda.minReplicas }}
+  maxReplicaCount: {{ .Values.worker.keda.maxReplicas }}
+  pollingInterval: {{ .Values.worker.keda.pollingInterval }}
+  cooldownPeriod: {{ .Values.worker.keda.cooldownPeriod }}
+  triggers:
+    # Scale on arq backlog (ZCARD via the app's depth endpoint). KEDA's redis scaler
+    # only does LLEN — wrong for arq's sorted-set queue — so we use metrics-api.
+    # replicas ≈ ceil(depth / targetValue), clamped to [min, max].
+    - type: metrics-api
+      metadata:
+        url: "http://{{ include "orchestrator.fullname" . }}-api:{{ .Values.api.service.port }}/metrics/queue-depth"
+        valueLocation: "depth"
+        targetValue: {{ .Values.worker.keda.targetDepthPerReplica | quote }}
+{{- end }}

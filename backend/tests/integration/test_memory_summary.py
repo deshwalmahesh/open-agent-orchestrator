@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 from uuid import uuid4
 
-import pytest
 
 from app.db import get_session_factory
 from app.db.models import AgentDB, ChatDB, MessageDB, UserDB

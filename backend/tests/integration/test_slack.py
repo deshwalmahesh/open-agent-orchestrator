@@ -8,10 +8,9 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock
 
-import pytest
 
 from app.db import get_session_factory
-from app.db.models import AgentDB, UserDB
+from app.db.models import UserDB
 from app.integrations.channels.slack_adapter import handle_slack_message
 
 
@@ -85,6 +84,32 @@ def test_known_user_with_agent_dispatches_run(client, signup_and_login, auth_hea
 
     assert captured["text"] == "hi"
     say.assert_awaited_once_with(thread_ts="1.1", text="echoed: hi")
+
+
+def test_failed_run_shows_friendly_message(client, signup_and_login, auth_header, sample_agent_config, monkeypatch):
+    """A failed run posts the taxonomy's user-facing message verbatim — no
+    'That run failed:' prefix, no raw exception."""
+    token = signup_and_login("alice@example.com")
+    asyncio.run(_attach_slack_id("alice@example.com", "U_ALICE"))
+    client.post("/agents", json=sample_agent_config(), headers=auth_header(token))
+
+    friendly = "The model is busy right now — please try again shortly."
+
+    async def fake_start_run(session, *, chat_id, user_text):
+        from uuid import uuid4
+        return uuid4()
+
+    async def fake_wait_for_reply(run_id, *, timeout=60.0):
+        return ("failed", friendly)
+
+    monkeypatch.setattr("app.integrations.channels.slack_adapter.start_run", fake_start_run)
+    monkeypatch.setattr(
+        "app.integrations.channels.slack_adapter.wait_for_reply", fake_wait_for_reply
+    )
+
+    say = AsyncMock()
+    asyncio.run(handle_slack_message(_event(), say, session_factory=get_session_factory()))
+    say.assert_awaited_once_with(thread_ts="1.1", text=friendly)
 
 
 def test_thread_reuses_same_chat(client, signup_and_login, auth_header, sample_agent_config, monkeypatch):

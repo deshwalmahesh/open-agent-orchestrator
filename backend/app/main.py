@@ -25,7 +25,7 @@ from app.config import get_settings
 from app.db import create_all, seed_defaults
 from app.logging import configure_logging
 from app.runtime.checkpointer import build_checkpointer
-from app.services.run_service import drain_pending, set_checkpointer
+from app.services.run_service import drain_pending, reconcile_orphaned_runs, set_checkpointer
 from app.users import UserCreate, UserRead, UserUpdate, auth_backend, fastapi_users
 
 log = structlog.get_logger(__name__)
@@ -37,10 +37,19 @@ async def lifespan(app: FastAPI):
     configure_logging(settings.log_level)
     log.info("app.startup", env=settings.app_env)
 
+    # Fail-fast: never run prod with the placeholder JWT secret — it forfeits auth
+    # integrity (anyone can forge tokens). Make accidental deploy impossible.
+    if settings.app_env == "prod" and settings.jwt_secret == "CHANGE_ME_IN_PROD":
+        raise RuntimeError("JWT_SECRET must be overridden in prod (still the default placeholder)")
+
     # App-data DB. create_all is idempotent. README documents this is v1-grade
     # (no Alembic); prod swaps DATABASE_URL to Postgres and adds migrations.
     await create_all()
     await seed_defaults()
+
+    # Backstop: fail any run left non-terminal by a prior crash so waiters aren't
+    # stuck forever. Safe in multi-worker mode (only reaps runs older than 2× job_timeout).
+    await reconcile_orphaned_runs()
 
     # Checkpointer is required for any Run, but we want /health to stay green
     # if Redis is briefly down during dev. Log loudly; downstream endpoints
@@ -59,31 +68,31 @@ async def lifespan(app: FastAPI):
             hint="run `docker compose up` — runs still work without Redis but no within-run checkpointing",
         )
 
-    # Slack — single platform bot. Starts from env vars OR from the first user
-    # who connected via POST /slack/connect (tokens saved in UserDB).
+    # arq pool — only in "queue" mode. The API enqueues; a separate `arq
+    # app.worker.WorkerSettings` process consumes. If the pool can't be created,
+    # start_run falls back to inline execution (logged loudly).
+    app.state.arq_pool = None
+    if settings.run_executor == "queue":
+        try:
+            from arq import create_pool
+            from arq.connections import RedisSettings
+
+            from app.services.run_service import set_arq_pool
+
+            app.state.arq_pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+            set_arq_pool(app.state.arq_pool)
+            log.info("arq.pool_ready")
+        except Exception as exc:
+            log.error("arq.pool_unavailable", error=str(exc), hint="runs fall back to inline")
+
+    # Slack — single platform bot (Socket Mode). Socket Mode is single-consumer:
+    # if every API replica opened a socket, each message would process N times.
+    # A Redis leader lock ensures exactly ONE replica runs it; a poller takes over
+    # if the leader dies. See _slack_leadership.
     app.state.slack = None
     app.state.slack_task = None
-    _slack_bot = settings.slack_bot_token
-    _slack_app = settings.slack_app_token
-    if not (_slack_bot and _slack_app):
-        # Fall back to any user's saved tokens
-        from sqlalchemy import select
-        from app.db import get_session_factory
-        from app.db.models import UserDB as _UserDB
-        async with get_session_factory()() as _s:
-            _row = (await _s.execute(
-                select(_UserDB).where(
-                    _UserDB.slack_bot_token.isnot(None),
-                    _UserDB.slack_app_token.isnot(None),
-                ).limit(1)
-            )).scalar_one_or_none()
-            if _row:
-                _slack_bot = _row.slack_bot_token
-                _slack_app = _row.slack_app_token
-    if _slack_bot and _slack_app:
-        from app.integrations.channels.slack_adapter import SlackAdapter
-        app.state.slack = SlackAdapter(_slack_bot, _slack_app)
-        app.state.slack_task = asyncio.create_task(app.state.slack.start())
+    app.state.slack_leader = None
+    app.state.slack_leader_task = asyncio.create_task(_slack_leadership(app))
 
     # WhatsApp — pre-warm adapter cache for all users with saved Twilio creds.
     # No persistent connection needed (webhook-based, stateless).
@@ -94,13 +103,75 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         log.info("app.shutdown")
+        if app.state.slack_leader_task is not None:
+            app.state.slack_leader_task.cancel()
         if app.state.slack is not None:
             await app.state.slack.stop()
         if app.state.slack_task is not None:
             app.state.slack_task.cancel()
+        if app.state.slack_leader is not None:
+            await app.state.slack_leader.release()  # let another replica take over promptly
         await drain_pending()
+        if app.state.arq_pool is not None:
+            await app.state.arq_pool.aclose()
         if app.state.redis_client is not None:
             await app.state.redis_client.aclose()
+        from app.redis_client import aclose_redis
+        await aclose_redis()
+
+
+async def _resolve_slack_tokens() -> tuple[str | None, str | None]:
+    """Env tokens, else the first user who connected via POST /slack/connect."""
+    s = get_settings()
+    if s.slack_bot_token and s.slack_app_token:
+        return s.slack_bot_token, s.slack_app_token
+    from sqlalchemy import select
+    from app.db import get_session_factory
+    from app.db.models import UserDB as _UserDB
+    async with get_session_factory()() as _s:
+        row = (await _s.execute(
+            select(_UserDB).where(
+                _UserDB.slack_bot_token.isnot(None), _UserDB.slack_app_token.isnot(None)
+            ).limit(1)
+        )).scalar_one_or_none()
+    return (row.slack_bot_token, row.slack_app_token) if row else (None, None)
+
+
+def _start_slack(app: FastAPI, bot: str, app_token: str) -> None:
+    from app.integrations.channels.slack_adapter import SlackAdapter
+    app.state.slack = SlackAdapter(bot, app_token)
+    app.state.slack_task = asyncio.create_task(app.state.slack.start())
+
+
+async def _slack_leadership(app: FastAPI) -> None:
+    """Run Slack Socket Mode on exactly one replica. Acquire a Redis leader lock;
+    only the holder starts the adapter; refresh the lease while leading. If Redis is
+    unavailable (single-process dev), start unguarded — there's no contention to lose."""
+    from app.leader import Leader
+
+    bot, app_token = await _resolve_slack_tokens()
+    if not (bot and app_token):
+        return  # Slack not configured
+
+    leader = Leader("slack:leader", ttl=30)
+    app.state.slack_leader = leader
+    while True:
+        try:
+            if app.state.slack is None:
+                if await leader.acquire():
+                    _start_slack(app, bot, app_token)
+                    log.info("slack.leader_acquired")
+            else:
+                await leader.refresh()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Redis down: in a single-process deployment there's no contention, so
+            # start unguarded rather than never starting Slack at all.
+            if app.state.slack is None:
+                log.warning("slack.leader_unavailable_starting_unguarded", error=str(exc))
+                _start_slack(app, bot, app_token)
+        await asyncio.sleep(10)
 
 
 async def _request_id_middleware(request: Request, call_next):
@@ -115,7 +186,14 @@ async def _request_id_middleware(request: Request, call_next):
     return response
 
 
-limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
+# Redis-backed storage in prod so the IP rate limit is shared across replicas and
+# survives restarts (in-memory only works for a single process). dev/test stay
+# in-memory so they need no Redis. Per-user fairness is the concurrency cap (3b);
+# this limiter is the coarse cross-replica DoS guard.
+_lim_storage = get_settings().redis_url if get_settings().app_env == "prod" else None
+limiter = Limiter(
+    key_func=get_remote_address, default_limits=["60/minute"], storage_uri=_lim_storage
+)
 
 
 def create_app() -> FastAPI:
@@ -128,14 +206,10 @@ def create_app() -> FastAPI:
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.add_middleware(SlowAPIMiddleware)
+    origins = [o.strip() for o in get_settings().cors_origins.split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            "http://localhost:5173",   # Vite dev (no Docker)
-            "http://localhost:80",     # Docker compose frontend
-            "http://localhost",        # Docker compose frontend (port 80, no explicit port)
-            "http://127.0.0.1:5173",
-        ],
+        allow_origins=origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

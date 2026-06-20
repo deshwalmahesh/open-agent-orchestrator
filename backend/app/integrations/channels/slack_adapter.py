@@ -169,7 +169,8 @@ async def handle_slack_message(
     if status == "timeout":
         out = "Still working on that — taking longer than usual. Try again in a moment."
     elif status == "failed":
-        out = f"That run failed: {reply or 'unknown error'}"
+        # `reply` is the user-facing message from the failure taxonomy (app.errors).
+        out = reply or "Something went wrong on our side — please try again."
     elif not reply or not reply.strip():
         out = (
             "I produced an empty reply — usually means the token budget was spent "

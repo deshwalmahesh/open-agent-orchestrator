@@ -30,6 +30,7 @@ from app.db import get_async_session, get_session_factory
 from app.db.models import AgentDB, UserDB
 from app.db.repos import get_agent
 from app.integrations.channels.whatsapp_adapter import WhatsAppAdapter, handle_whatsapp_message
+from app.redis_client import get_redis
 from app.users import current_active_user
 
 log = structlog.get_logger()
@@ -41,19 +42,33 @@ router = APIRouter(prefix="/whatsapp", tags=["whatsapp"])
 # ---------------------------------------------------------------------------
 _adapters: dict[str, WhatsAppAdapter] = {}
 
-# Message dedup: bounded set of recently seen MessageSids (prevents Twilio retries)
+# Message dedup. Primary: Redis SET NX (shared across replicas — a Twilio retry
+# routed to a different pod is still caught). Fallback: bounded in-process set
+# (single-process dev, or Redis briefly down — best-effort, not cross-replica).
 _DEDUP_MAX = 2000
+_DEDUP_TTL_S = 3600  # Twilio retries happen within minutes; 1h is ample
 _seen_message_sids: OrderedDict[str, None] = OrderedDict()
 
 
-def _dedup_check(message_sid: str) -> bool:
-    """Return True if this MessageSid was already processed."""
+def _dedup_fallback(message_sid: str) -> bool:
     if message_sid in _seen_message_sids:
         return True
     _seen_message_sids[message_sid] = None
     while len(_seen_message_sids) > _DEDUP_MAX:
         _seen_message_sids.popitem(last=False)
     return False
+
+
+async def _dedup_check(message_sid: str) -> bool:
+    """Return True if this MessageSid was already processed.
+
+    Redis SET NX is atomic, so two replicas racing the same retry can't both win."""
+    try:
+        was_new = await get_redis().set(f"wa:seen:{message_sid}", "1", nx=True, ex=_DEDUP_TTL_S)
+        return not was_new
+    except Exception as exc:
+        log.warning("whatsapp.dedup.redis_down", error=str(exc))
+        return _dedup_fallback(message_sid)
 
 
 def get_or_create_adapter(account_sid: str, auth_token: str, from_number: str) -> WhatsAppAdapter:
@@ -267,7 +282,7 @@ async def webhook(request: Request) -> PlainTextResponse:
         return PlainTextResponse(_EMPTY_TWIML, media_type="application/xml")
 
     # Dedup — Twilio retries on timeout
-    if message_sid and _dedup_check(message_sid):
+    if message_sid and await _dedup_check(message_sid):
         log.debug("whatsapp.dedup", message_sid=message_sid)
         return PlainTextResponse(_EMPTY_TWIML, media_type="application/xml")
 

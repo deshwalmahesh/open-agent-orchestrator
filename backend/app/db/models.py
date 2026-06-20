@@ -9,6 +9,7 @@ from fastapi_users_db_sqlalchemy import SQLAlchemyBaseUserTableUUID
 from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.crypto import EncryptedJSON, EncryptedStr
 from app.db import Base
 from app.domain import utcnow
 
@@ -21,12 +22,14 @@ class UserDB(SQLAlchemyBaseUserTableUUID, Base):
     slack_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True, index=True)
     # "free" | "paid" | "admin" — controls auto-seeded keys and rate limits
     plan: Mapped[str] = mapped_column(String(20), default="free", server_default="free")
-    # Per-user Slack bot tokens; first user to connect becomes the platform Slack bot
-    slack_bot_token: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    slack_app_token: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    # Per-user Twilio WhatsApp credentials (multi-user concurrent, unlike Slack)
+    # Per-user Slack bot tokens; first user to connect becomes the platform Slack bot.
+    # Encrypted at rest (EncryptedStr) — these are live OAuth secrets.
+    slack_bot_token: Mapped[str | None] = mapped_column(EncryptedStr, nullable=True)
+    slack_app_token: Mapped[str | None] = mapped_column(EncryptedStr, nullable=True)
+    # Per-user Twilio WhatsApp credentials (multi-user concurrent, unlike Slack).
+    # account_sid is an identifier (not secret); auth_token is the secret → encrypted.
     whatsapp_account_sid: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    whatsapp_auth_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    whatsapp_auth_token: Mapped[str | None] = mapped_column(EncryptedStr, nullable=True)
     whatsapp_from_number: Mapped[str | None] = mapped_column(String(30), nullable=True)
     # Public base URL for webhook signature validation; set after first deploy
     webhook_base_url: Mapped[str | None] = mapped_column(String(300), nullable=True)
@@ -38,7 +41,8 @@ class AgentDB(Base):
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
     user_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("user.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(120))
-    config: Mapped[dict] = mapped_column(JSON)  # full AgentConfig dump
+    # full AgentConfig dump; encrypted at rest — carries the BYOK llm.api_key
+    config: Mapped[dict] = mapped_column(EncryptedJSON)
     # NULL = Draft (cannot be used in chats / Slack). Set by POST /agents/{id}/deploy.
     # Edits after deploy do NOT reset this — explicit user choice.
     deployed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -85,7 +89,8 @@ class UserToolConfigDB(Base):
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
     user_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("user.id", ondelete="CASCADE"), index=True)
     tool_name: Mapped[str] = mapped_column(String(120))
-    config: Mapped[dict] = mapped_column(JSON, default=dict)
+    # per-tool credentials (e.g. Tavily key) — encrypted at rest
+    config: Mapped[dict] = mapped_column(EncryptedJSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

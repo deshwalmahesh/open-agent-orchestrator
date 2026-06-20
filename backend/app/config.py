@@ -68,6 +68,12 @@ class Settings(BaseSettings):
     jwt_secret: str = "CHANGE_ME_IN_PROD"
     jwt_lifetime_seconds: int = 60 * 60 * 24 * 7  # 7d
 
+    # Field-encryption keys for secrets at rest (Fernet), comma-separated, newest
+    # first (rotation: prepend a new key). Generate one with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # Unset = passthrough (dev/test); prod refuses to boot without it (see main.lifespan).
+    secret_encryption_keys: str | None = None
+
     # CORS allowed origins (comma-separated). Defaults cover local dev; set real
     # origins per deploy. "*" is intentionally NOT a default (credentials are sent).
     cors_origins: str = "http://localhost:5173,http://localhost:80,http://localhost,http://127.0.0.1:5173"

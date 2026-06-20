@@ -42,6 +42,9 @@ async def lifespan(app: FastAPI):
     # integrity (anyone can forge tokens). Make accidental deploy impossible.
     if settings.app_env == "prod" and settings.jwt_secret == "CHANGE_ME_IN_PROD":
         raise RuntimeError("JWT_SECRET must be overridden in prod (still the default placeholder)")
+    # Fail-fast: prod must encrypt tenant secrets at rest (BYOK keys, Slack/Twilio tokens).
+    if settings.app_env == "prod" and not settings.secret_encryption_keys:
+        raise RuntimeError("SECRET_ENCRYPTION_KEYS must be set in prod (secrets-at-rest encryption)")
 
     # App-data DB. create_all is idempotent. README documents this is v1-grade
     # (no Alembic); prod swaps DATABASE_URL to Postgres and adds migrations.

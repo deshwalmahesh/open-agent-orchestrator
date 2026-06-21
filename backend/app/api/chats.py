@@ -24,7 +24,8 @@ from app.db.repos import (
     list_messages,
     update_chat,
 )
-from app.errors import QUEUE_UNAVAILABLE, info_for
+from app.errors import QUEUE_UNAVAILABLE, QUOTA_EXCEEDED, info_for
+from app.quota import QuotaExceeded
 from app.services.run_service import ConcurrencyLimitExceeded, QueueFull, start_run
 from app.users import current_active_user
 
@@ -229,6 +230,13 @@ async def post_message(
             status.HTTP_429_TOO_MANY_REQUESTS,
             f"You have {exc.active} runs in progress (plan limit {exc.cap}). "
             "Wait for one to finish or upgrade your plan.",
+        )
+    except QuotaExceeded as exc:
+        # Daily token cap hit — business limit, not an error. Tell them to wait/upgrade.
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            f"{info_for(QUOTA_EXCEEDED).user_message} "
+            f"(used {exc.used} of {exc.cap} daily tokens).",
         )
     except QueueFull:
         # Backlog over cap — fail fast so the client retries instead of waiting forever.

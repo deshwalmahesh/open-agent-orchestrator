@@ -41,6 +41,7 @@ from app.errors import INTERRUPTED, RUN_TIMEOUT, STEP_LIMIT, classify, info_for
 from app.llm import build_chat_model, invoke_with_breaker
 from app.observability import get_handler, run_span
 from app.plans import limits_for
+from app.quota import add_usage, cost_for, enforce_quota
 from app.runtime.agent import _SUBAGENT_USAGE, _accumulate_usage, build_agent_tree
 from app.runtime.events import EMITTERS, RunEventEmitter
 from app.runtime.tools import build_registry
@@ -317,6 +318,7 @@ async def _execute(run_id: UUID, chat_id: UUID, user_text: str, files: list[dict
         usage = _extract_usage(result["messages"])
         for k in usage:
             usage[k] += sub_usage.get(k, 0)
+        cost = cost_for(cfg.llm.model, usage)  # USD, from the static price table
 
         # Phase 3: post-LLM persistence — fresh session, sender_id captured in Phase 1.
         async with session_factory() as session:
@@ -330,8 +332,10 @@ async def _execute(run_id: UUID, chat_id: UUID, user_text: str, files: list[dict
             )
             await finalize_run(
                 session, run_id=run_id, status="succeeded", total_tokens=usage,
-                tool_calls=usage_counter.tool_calls,
+                total_cost=cost, tool_calls=usage_counter.tool_calls,
             )
+        # Meter against the user's daily quota (best-effort; the run is already committed).
+        await add_usage(user_id, usage.get("total_tokens", 0))
 
         await emitter.emit("agent.message", {"sender": sender_id, "content": reply})
         await emitter.emit("run.finished", {"usage": usage, "status": "succeeded"})
@@ -436,9 +440,12 @@ async def start_run(
     chat = await session.get(ChatDB, chat_id)
     if chat is None:
         raise ValueError(f"chat not found: {chat_id}")
-    # Per-user fairness first, then global shed — both before creating the row so we
-    # never persist a run we're about to reject.
+    # Per-user fairness (concurrency + daily token quota) first, then global shed —
+    # all before creating the row so we never persist a run we're about to reject.
+    # session.get(UserDB) below is identity-mapped (same fetch _enforce_concurrency uses).
+    user = await session.get(UserDB, chat.user_id)
     await _enforce_concurrency(session, chat.user_id)
+    await enforce_quota(chat.user_id, user.plan if user else None)
     await _check_load_shed()
     run = await create_run(session, chat_id=chat_id, agent_id=chat.agent_id)
 

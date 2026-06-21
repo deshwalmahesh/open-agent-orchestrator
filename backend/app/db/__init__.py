@@ -27,7 +27,7 @@ def _build_engine(url: str, s: Settings) -> AsyncEngine:
     """Create the async engine with pool tuning. SQLite (file/single-writer) ignores
     pool args. Postgres gets an env-tuned QueuePool, or NullPool when fronted by
     PgBouncer (the proxy owns pooling; asyncpg also needs its statement cache off)."""
-    kwargs: dict = {"future": True}
+    kwargs: dict = {}  # future=True is the default in SQLAlchemy 2.0
     if not url.startswith("sqlite"):
         if s.db_use_null_pool:
             kwargs["poolclass"] = NullPool
@@ -82,10 +82,12 @@ async def create_all() -> None:
         adds: dict[str, list[tuple[str, str]]] = {
             "user": [
                 ("plan", "VARCHAR(20) NOT NULL DEFAULT 'free'"),
-                ("slack_bot_token", "VARCHAR(200)"),
-                ("slack_app_token", "VARCHAR(200)"),
+                # Encrypted-at-rest columns (EncryptedStr → Text): Fernet ciphertext is far
+                # longer than the plaintext token, so these MUST be TEXT, not VARCHAR(n).
+                ("slack_bot_token", "TEXT"),
+                ("slack_app_token", "TEXT"),
                 ("whatsapp_account_sid", "VARCHAR(64)"),
-                ("whatsapp_auth_token", "VARCHAR(64)"),
+                ("whatsapp_auth_token", "TEXT"),
                 ("whatsapp_from_number", "VARCHAR(30)"),
                 ("webhook_base_url", "VARCHAR(300)"),
             ],

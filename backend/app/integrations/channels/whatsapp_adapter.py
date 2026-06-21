@@ -175,23 +175,12 @@ async def handle_whatsapp_message(
 
         run_id = await start_run(session, chat_id=chat.id, user_text=body)
 
-    # Import from slack_adapter — wait_for_reply is channel-agnostic
-    from app.integrations.channels.slack_adapter import wait_for_reply
+    # wait_for_reply + format_reply are channel-agnostic — reuse them from slack_adapter
+    # so the failed/timeout/empty reply UX stays identical across channels.
+    from app.integrations.channels.slack_adapter import format_reply, wait_for_reply
 
     status, reply = await wait_for_reply(run_id, timeout=120.0)
-    if status == "timeout":
-        out = "Still working on that — taking longer than usual. Try again in a moment."
-    elif status == "failed":
-        # `reply` is the user-facing message from the failure taxonomy (app.errors).
-        out = reply or "Something went wrong on our side — please try again."
-    elif not reply or not reply.strip():
-        out = (
-            "I produced an empty reply — usually means the token budget was spent "
-            "on reasoning before any output. Try a simpler prompt, or increase the "
-            "agent's max_tokens."
-        )
-    else:
-        out = reply
+    out = format_reply(status, reply)
 
     try:
         await adapter.send_message(to=from_phone, body=out)

@@ -106,6 +106,23 @@ async def wait_for_reply(run_id: UUID, *, timeout: float = 60.0) -> tuple[str, s
     return ("timeout", None)
 
 
+def format_reply(status: str, reply: str | None) -> str:
+    """Map a (status, reply) from wait_for_reply to channel-facing text. Shared by
+    Slack + WhatsApp so the failed/timeout/empty UX can't drift between channels."""
+    if status == "timeout":
+        return "Still working on that — taking longer than usual. Try again in a moment."
+    if status == "failed":
+        # `reply` is the user-facing message from the failure taxonomy (app.errors).
+        return reply or "Something went wrong on our side — please try again."
+    if not reply or not reply.strip():
+        return (
+            "I produced an empty reply — usually means the token budget was spent "
+            "on reasoning before any output. Try a simpler prompt, or increase the "
+            "agent's `max_tokens`."
+        )
+    return reply
+
+
 async def handle_slack_message(
     event: dict,
     say: Callable[..., Awaitable[Any]],
@@ -166,20 +183,7 @@ async def handle_slack_message(
         run_id = await start_run(session, chat_id=chat.id, user_text=text)
 
     status, reply = await wait_for_reply(run_id, timeout=120.0)
-    if status == "timeout":
-        out = "Still working on that — taking longer than usual. Try again in a moment."
-    elif status == "failed":
-        # `reply` is the user-facing message from the failure taxonomy (app.errors).
-        out = reply or "Something went wrong on our side — please try again."
-    elif not reply or not reply.strip():
-        out = (
-            "I produced an empty reply — usually means the token budget was spent "
-            "on reasoning before any output. Try a simpler prompt, or increase the "
-            "agent's `max_tokens`."
-        )
-    else:
-        out = reply
-    await say(thread_ts=thread_ts, text=out)
+    await say(thread_ts=thread_ts, text=format_reply(status, reply))
 
 
 class SlackAdapter:

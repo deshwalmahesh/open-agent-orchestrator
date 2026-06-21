@@ -10,6 +10,7 @@ from run_id so user feedback (thumbs) can be attached later as a Langfuse score.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from uuid import UUID
 
 import structlog
@@ -47,7 +48,6 @@ def run_span(run_id: UUID):
     """Context manager pinning the run's trace to trace_id_for(run_id) so the handler's
     spans land on a known trace. Returns a nullcontext when Langfuse is disabled."""
     if not enabled():
-        from contextlib import nullcontext
         return nullcontext()
     try:
         from langfuse import get_client
@@ -56,7 +56,6 @@ def run_span(run_id: UUID):
         )
     except Exception as exc:
         log.warning("langfuse.span_unavailable", error=str(exc))
-        from contextlib import nullcontext
         return nullcontext()
 
 

@@ -44,7 +44,7 @@ async def test_free_plan_rejects_at_cap():
     sf = get_session_factory()
     async with sf() as s:
         with pytest.raises(ConcurrencyLimitExceeded):
-            await _enforce_concurrency(s, uid)
+            await _enforce_concurrency(s, uid, "free")
 
 
 @pytest.mark.asyncio
@@ -53,4 +53,4 @@ async def test_paid_plan_allows_more():
     uid = await _user_with_runs("paid", ["running", "running"])  # paid cap = 10
     sf = get_session_factory()
     async with sf() as s:
-        await _enforce_concurrency(s, uid)  # 2 < 10 → no raise
+        await _enforce_concurrency(s, uid, "paid")  # 2 < 10 → no raise

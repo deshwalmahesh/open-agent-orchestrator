@@ -399,14 +399,14 @@ class ConcurrencyLimitExceeded(Exception):
         super().__init__(f"{active} active runs >= plan cap {cap}")
 
 
-async def _enforce_concurrency(session: AsyncSession, user_id: UUID) -> None:
+async def _enforce_concurrency(session: AsyncSession, user_id: UUID, plan: str | None) -> None:
     """Reject if the user is at their plan's concurrent-run cap. Fairness/backpressure
     so one tenant can't flood the queue and starve others.
 
     ponytail: count-then-create has a tiny race (two exactly-simultaneous requests can
     both pass at cap-1), so the cap is a guardrail, not a hard ceiling. Use an atomic
     Redis INCR with decrement-on-finalize only if strict enforcement is ever required."""
-    cap = limits_for((await session.get(UserDB, user_id)).plan).max_concurrent_runs
+    cap = limits_for(plan).max_concurrent_runs
     if cap <= 0:  # unlimited plan
         return
     active = await count_active_runs(session, user_id=user_id)
@@ -442,10 +442,10 @@ async def start_run(
         raise ValueError(f"chat not found: {chat_id}")
     # Per-user fairness (concurrency + daily token quota) first, then global shed —
     # all before creating the row so we never persist a run we're about to reject.
-    # session.get(UserDB) below is identity-mapped (same fetch _enforce_concurrency uses).
     user = await session.get(UserDB, chat.user_id)
-    await _enforce_concurrency(session, chat.user_id)
-    await enforce_quota(chat.user_id, user.plan if user else None)
+    plan = user.plan if user else None
+    await _enforce_concurrency(session, chat.user_id, plan)
+    await enforce_quota(chat.user_id, plan)
     await _check_load_shed()
     run = await create_run(session, chat_id=chat_id, agent_id=chat.agent_id)
 

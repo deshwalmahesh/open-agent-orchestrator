@@ -113,7 +113,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Image CVE scan (Trivy)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.33.1
         with:
           image-ref: ${{ steps.img.outputs.name }}:${{ github.sha }}
           severity: HIGH,CRITICAL

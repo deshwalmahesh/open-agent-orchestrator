@@ -28,6 +28,8 @@ secrets:
     DATABASE_URL: ""           # postgresql+asyncpg://user:pass@host:5432/db
     REDIS_URL: ""              # redis://host:6379/0  (redis-stack for the checkpointer)
     JWT_SECRET: ""             # MUST override — app refuses CHANGE_ME_IN_PROD in prod
+    SECRET_ENCRYPTION_KEYS: "" # MUST set in prod — Fernet key(s) for secrets-at-rest.
+                               #   gen: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 
 # One-shot schema bootstrap before each rollout (Helm pre-install/pre-upgrade hook).
 # Runs as ONE pod so concurrent replicas never race on create_all/seed.

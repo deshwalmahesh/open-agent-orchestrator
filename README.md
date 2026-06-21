@@ -35,6 +35,9 @@ Ordered by impact — most useful first.
 11. **Multi-user, multi-pipeline, multi-chat.** `fastapi-users` JWT auth. Each user owns N pipelines; each pipeline backs N chats (web + Slack threads); each chat carries its own `MessageDB` history + rolling summary. Cross-user reads return `404 not 403` (no existence leak). Reassigning a chat to a different Deployed pipeline is a single PATCH.
 12. **SQLite by default, Postgres by URL swap.** Idempotent migrations via SQLAlchemy `inspect()` — no Alembic in v1, no startup error logs from "column already exists".
 13. **Docker Compose dev loop.** Full bind mount + anonymous volumes for `node_modules` / `.venv` → `docker compose down && up` = truly fresh install; restarts in between are instant. Vite polling enabled so macOS Docker bind mounts hot-reload reliably.
+14. **Durable, horizontally-scalable execution.** `POST /messages` writes a row + enqueues to an [arq](https://arq-docs.helpmanual.io/) Redis queue and returns in ms — the API never blocks on an LLM. Workers pull at their own rate (bounded `max_jobs` = backpressure), crashes redeliver (at-least-once + idempotent `_execute`), and a startup reconciler reaps orphans. Stateless API + worker pods scale independently: **HPA** on API CPU, **KEDA** on worker queue-depth. A global load-shed cap returns `503` instead of melting under a burst. (`RUN_EXECUTOR=inline` for single-box dev — same code path.)
+15. **Multi-tenant security & cost controls.** Tenant secrets (BYOK LLM keys, Slack/Twilio tokens) are **Fernet-encrypted at rest** (`MultiFernet` key rotation). Per-plan **concurrency caps** + **daily token quotas** (`429` when exceeded) + per-model **cost metering** (`total_cost` per run). Redis-backed rate limiting across replicas. Prod **fail-fast** refuses to boot with a default `JWT_SECRET` or missing encryption keys.
+16. **Observability, off-the-shelf.** Optional **Langfuse** tracing (drop-in callback → per-run tool/sub-agent/token/latency spans, incl. MCP) + **Prometheus** `/metrics` (HTTP RED metrics free, plus `runs_total`/`queue_depth`) for Grafana dashboards & alerts. In-app **thumbs up/down feedback** + per-user usage stats (`/stats`). No vendor lock-in.
 
 ---
 
@@ -53,23 +56,36 @@ backend/                          FastAPI + LangGraph
       tool_configs.py             Per-user tool credentials (validate before save)
       slack.py                    Connect / disconnect / set-active (per-user)
       whatsapp.py                 Connect / disconnect / set-active + public webhook
-      health.py
+      stats.py                    Per-user usage stats (runs, reviews, top tools)
+      health.py                   /health, /health/ready, /metrics/queue-depth
     runtime/
       agent.py                    build_agent_tree() — recursive ReAct, contextvar token aggregation
       tools.py                    Built-in tool registry (calculator, web_search, html_to_md, pdf_to_text, python_sandbox)
       checkpointer.py             Redis checkpointer (within-run state)
-    services/run_service.py       Schedule + execute + persist + emit
+      events.py                   Per-run event emitter (DB + cross-process Redis pub/sub)
+      usage_callback.py           UsageCounter — one callback counts every tool/sub-agent/MCP call
+    services/run_service.py       Schedule + execute + persist + emit (+ quota/concurrency/load-shed)
+    worker.py                     arq worker entrypoint (RUN_EXECUTOR=queue) — durable execution
     integrations/
-      channels/slack_adapter.py   Bolt Socket Mode adapter
+      channels/slack_adapter.py   Bolt Socket Mode adapter (+ shared format_reply)
       channels/whatsapp_adapter.py Twilio WhatsApp adapter (per-user, stateless REST)
       sample_mcp_server.py        Demo MCP server (timestamp + word_count tools)
     db/
-      models.py                   SQLAlchemy 2.0 async ORM
+      models.py                   SQLAlchemy 2.0 async ORM (+ encrypted columns)
       repos.py                    Plain async helpers (caller owns the session)
       seeds/personas.yaml         Default personas, loaded on startup
-    llm.py                        build_chat_model() — provider dispatch (openai/anthropic/google/vllm)
+    llm.py                        build_chat_model() + retry + circuit breaker
+    crypto.py                     EncryptedStr/EncryptedJSON — Fernet secrets-at-rest
+    quota.py                      Daily token quota (Redis) + per-model cost table
+    plans.py                      Per-plan limits (concurrency / daily tokens)
+    metrics.py                    Prometheus counters/gauges (runs_total, queue_depth)
+    observability.py              Langfuse tracing (env-gated, no-op when unset)
+    errors.py                     Failure taxonomy — stable error_code + user message + retry policy
+    redis_client.py               Shared coordination Redis (pub/sub, dedup, leader lock, quota)
+    leader.py                     Redis leader lock (single-runner Slack Socket Mode)
+    migrate.py                    One-shot schema bootstrap (Helm pre-upgrade Job)
     domain.py                     Pydantic schemas (AgentConfig, LLMConfig, MemoryConfig, RunEvent)
-    main.py                       FastAPI app + lifespan (Slack autostart, Redis checkpointer)
+    main.py                       FastAPI app + lifespan (Slack autostart, reconciler, /metrics)
 
 frontend/                         React + Vite + ReactFlow + TanStack Query + shadcn/Tailwind
   src/
@@ -90,7 +106,10 @@ frontend/                         React + Vite + ReactFlow + TanStack Query + sh
     hooks/                        useAuth, useSSE
     lib/                          llm-defaults (localStorage BYOK), utils, isPipelineRoot
 
-docker-compose.yml                postgres + redis + backend + frontend + mcp-sample
+deploy/helm/orchestrator/         Helm chart: api + worker + HPA + KEDA + migrate Job + ConfigMap/Secret
+.github/workflows/ci.yml          CI: lint → secret/CVE/SAST scan → test (real Redis+PG) → helm lint → build+Trivy→GHCR
+Dockerfile                        Single image: builds frontend → static/, serves both (one-container deploy)
+docker-compose.yml                postgres + redis + backend + worker + mcp-sample + frontend
 ```
 
 ---
@@ -256,35 +275,89 @@ helm install mao deploy/helm/orchestrator \
   --set image.repository=ghcr.io/<owner>/<repo>/backend \
   --set secrets.data.DATABASE_URL='postgresql+asyncpg://user:pass@host:5432/db' \
   --set secrets.data.REDIS_URL='redis://host:6379/0' \
-  --set secrets.data.JWT_SECRET="$(openssl rand -hex 32)"
+  --set secrets.data.JWT_SECRET="$(openssl rand -hex 32)" \
+  --set secrets.data.SECRET_ENCRYPTION_KEYS="$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
 ```
 
-KEDA must be installed for worker autoscaling (`--set worker.keda.enabled=false` to fall back to fixed replicas). Validated end-to-end on a local `kind` cluster (migrate Job → pods Ready → `/health/ready` green).
+`JWT_SECRET` and `SECRET_ENCRYPTION_KEYS` are **required** (the chart defaults `APP_ENV=prod`, and the app refuses to boot in prod without them). KEDA must be installed for worker autoscaling (`--set worker.keda.enabled=false` to fall back to fixed replicas).
+
+### Test it locally on Kubernetes (kind)
+
+A full multi-pod run — API + worker + migrate Job + in-cluster Postgres/Redis — on your laptop. Validated end-to-end (migrate Job → pods Ready → `/health/ready` green → register `201`).
+
+```bash
+# 1. Cluster + build/load the single image (no registry needed)
+kind create cluster --name mao
+docker build -t mao/backend:dev .
+kind load docker-image mao/backend:dev --name mao
+
+# 2. Throwaway in-cluster Postgres + Redis (redis-stack = RediSearch for the checkpointer)
+kubectl create deployment pg --image=postgres:16-alpine
+kubectl set env deployment/pg POSTGRES_USER=agent POSTGRES_PASSWORD=agent POSTGRES_DB=agent
+kubectl expose deployment pg --port=5432
+kubectl create deployment redis --image=redis/redis-stack-server:latest
+kubectl expose deployment redis --port=6379
+
+# 3. Install the chart (KEDA off for a smoke test; fixed worker replicas)
+helm install mao deploy/helm/orchestrator \
+  --set image.repository=mao/backend --set image.tag=dev \
+  --set worker.keda.enabled=false \
+  --set secrets.data.DATABASE_URL='postgresql+asyncpg://agent:agent@pg:5432/agent' \
+  --set secrets.data.REDIS_URL='redis://redis:6379/0' \
+  --set secrets.data.JWT_SECRET="$(openssl rand -hex 32)" \
+  --set secrets.data.SECRET_ENCRYPTION_KEYS="$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+
+# 4. Watch the migrate Job run once, then API + worker pods come up
+kubectl get pods -w
+
+# 5. Smoke-test from your machine
+kubectl port-forward svc/mao-orchestrator-api 8000:80 &
+curl localhost:8000/health/ready                      # {"status":"ok","checks":{"redis":"ok","db":"ok"}}
+curl localhost:8000/metrics | grep runs_total          # Prometheus metrics exposed
+curl -X POST localhost:8000/auth/register -H 'content-type: application/json' \
+  -d '{"email":"a@b.c","password":"longenoughpwd123"}' # 201
+
+# 6. Tear down
+helm uninstall mao && kind delete cluster --name mao
+```
+
+> minikube works the same — swap `kind load docker-image` for `minikube image load mao/backend:dev`.
 
 ---
 
-## Setup
+### Prerequisites
 
-### Full stack (Docker — recommended)
+| To… | You need |
+|---|---|
+| Run the full stack (recommended) | **Docker** + Docker Compose v2 (`docker compose`). Nothing else. |
+| Hack on the backend directly | **Python 3.11+** and [**uv**](https://docs.astral.sh/uv/) (`pip install uv`) |
+| Hack on the frontend directly | **Node 20+** |
+| Run on local Kubernetes | **kind** (or minikube), **kubectl**, **helm** |
+
+No LLM key is needed to boot — credentials are entered per-user in the browser (BYOK). `cp .env.example .env` and you're ready.
+
+### One command (full stack)
 
 ```bash
-cp .env.example .env   # set LLM creds (any OpenAI-compatible provider), optional Slack tokens
-docker compose up
+make up        # = docker compose up -d --build   (postgres + redis + api + worker + mcp + frontend)
 ```
 
-Services: `ca-postgres`, `ca-redis`, `ca-backend`, `ca-frontend`, `ca-mcp-sample`.
+Brings up everything wired together — API in **queue mode** with a real arq worker, Postgres, Redis, the sample MCP server, and the web UI. Then:
 
-- Backend: `http://localhost:8000` (OpenAPI at `/docs`)
-- Frontend: `http://localhost`
-- Truly-fresh `down && up` reinstalls deps; quick `up` reuses cached volumes.
+- **Web UI:** `http://localhost`
+- **API + OpenAPI docs:** `http://localhost:8000/docs`
+- **Tear down:** `make down` (keep data) / `make clean` (drop volumes)
+- **Logs:** `make logs`
 
-### Backend only
+Containers: `ca-postgres`, `ca-redis`, `ca-backend`, `ca-worker`, `ca-mcp-sample`, `ca-frontend`. Edit `.env` first for optional Slack/Twilio/Langfuse keys; LLM creds are per-user in the UI.
+
+### Backend only (SQLite, no Docker)
 
 ```bash
 cd backend
 cp .env.example .env
-make demo    # uv sync + uvicorn :8000 (SQLite)
-make test    # 73 tests
+make demo    # uv sync + uvicorn :8000 (SQLite, inline run executor)
+make test    # 152 tests (Redis-gated ones skip if no Redis)
 ```
 
 Postgres without Docker: set `DATABASE_URL=postgresql+asyncpg://…` in `.env`.
@@ -396,7 +469,7 @@ Ordered by likely sequence.
 - [ ] **Open-source pipeline catalogue.** Browse + import community pipelines (similar to GPT Store / Replit templates, but pipelines and skills).
 - [ ] **Planner-decider node.** A router in front of the supervisor that classifies queries before dispatching.
 - [ ] **Streaming tokens.** SSE already streams events; pipe per-token deltas to the UI for faster perceived latency.
-- [ ] **Langfuse tracing.** Drop-in callback handler — already designed (see notes below).
+- [x] **Langfuse tracing + Prometheus metrics.** Drop-in Langfuse callback (per-run traces) + `/metrics` for Grafana. See **Observability & metrics** below.
 - [ ] **Human-in-the-loop.** LangGraph interrupt → DB-backed approval queue → resume.
 - [ ] **Per-user Slack BYOK.** Drop the single-owner platform bot model; each user gets their own Socket Mode connection.
 
@@ -405,12 +478,12 @@ Ordered by likely sequence.
 ## Tests
 
 ```bash
-cd backend && make test   # 129 tests
+cd backend && make test   # 152 tests (Redis-gated ones skip if no Redis; 1 live-LLM test skips without creds)
 ```
 
 Unit + integration: auth, agent CRUD with sub-agent tree validation (cycle / depth / cross-user / tool-name collision), Draft-rejection gating, persona/skill globals + ownership, tool-config validation flow, MCP discovery, chat + run lifecycle, Slack inbound dispatch, WhatsApp webhook dispatch (routing, chat reuse, dedup), memory rolling summary, multimodal file handling, sub-agent recursive build, **live LLM end-to-end** (skipped without creds).
 
-Production-hardening coverage: failure taxonomy, run idempotency + crash reconciler, per-run timeout, **arq queue end-to-end** (real worker drains a real Redis queue), cross-process SSE pub/sub, Redis leader lock, LLM retry + circuit breaker, DB pool config, load-shed + concurrency caps (413/429/503 at the HTTP boundary), prod fail-fast. Redis-gated tests run against a real Redis (skipped if none reachable). The Helm chart is validated end-to-end on a local `kind` cluster.
+Production-hardening coverage: failure taxonomy, run idempotency + crash reconciler, per-run timeout, **arq queue end-to-end** (real worker drains a real Redis queue), cross-process SSE pub/sub, Redis leader lock, LLM retry + circuit breaker, DB pool config, load-shed + concurrency caps + **daily token quota** (413/429/503 at the HTTP boundary), **secrets-at-rest encryption** (round-trip + ciphertext-at-rest DB proof), **cost accounting** (per-model price table), **Prometheus metrics** (counter funnel + `/metrics` render), prod fail-fast. Redis-gated tests run against a real Redis (skipped if none reachable). The Helm chart is validated end-to-end on a local `kind` cluster.
 
 Frontend: `npx tsc --noEmit` clean. Backend: `ruff check` + `bandit` + `pip-audit` + `gitleaks` clean.
 

@@ -229,7 +229,7 @@ Every failure maps to a stable `error_code` + user message + retry policy (`app/
 
 ### Security
 
-JWT auth (fastapi-users), per-user/IP rate limiting (Redis-backed in prod), per-plan concurrency caps, attachment size limits (413 before base64 decode), 404-not-403 on cross-user reads, and Twilio signature validation.
+JWT auth (fastapi-users), per-user/IP rate limiting (Redis-backed in prod), per-plan concurrency caps, **per-user daily token quotas** (Redis counter, free=50k/day → `429 QUOTA_EXCEEDED`) with per-model **cost metering** (`total_cost` from a static price table at finalize), attachment size limits (413 before base64 decode), 404-not-403 on cross-user reads, and Twilio signature validation.
 
 **Secrets at rest are encrypted (Fernet).** BYOK LLM keys (in `AgentDB.config`), per-tool keys (Tavily, in `UserToolConfigDB.config`), and Slack/Twilio tokens are transparently encrypted via SQLAlchemy `TypeDecorator`s (`app/crypto.py`) — a DB dump or read-replica leak exposes ciphertext, not tenant credentials. Keys come from `SECRET_ENCRYPTION_KEYS` (comma-separated, newest-first → `MultiFernet` rotation); decryption is plaintext-tolerant so enabling it on an existing DB is safe. Swapping Fernet for a cloud KMS touches only that one file.
 

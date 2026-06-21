@@ -418,13 +418,15 @@ Frontend: `npx tsc --noEmit` clean. Backend: `ruff check` + `bandit` + `pip-audi
 
 ## Observability & metrics
 
-**Two planes, by design** (off-the-shelf for observability, our DB for the product):
+**Three planes, by design** (off-the-shelf for tracing + metrics, our DB for the product):
 
-- **Langfuse (optional, off-the-shelf tracing).** Set `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` (+ `LANGFUSE_HOST`) and every run is traced — tool calls (**including MCP tools**, since they're standard LangChain tools), token usage, latency, and nested sub-agent spans — via the drop-in `CallbackHandler`. No tracing is hand-rolled. Unset = disabled (no-op), so dev/tests need nothing. Each run uses a deterministic Langfuse trace id derived from `run_id` so feedback attaches to the right trace.
+- **Langfuse (optional, off-the-shelf LLM tracing).** Set `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` (+ `LANGFUSE_HOST`) and every run is traced — tool calls (**including MCP tools**, since they're standard LangChain tools), token usage, latency, and nested sub-agent spans — via the drop-in `CallbackHandler`. No tracing is hand-rolled. Unset = disabled (no-op), so dev/tests need nothing. Each run uses a deterministic Langfuse trace id derived from `run_id` so feedback attaches to the right trace.
+
+- **Prometheus + Grafana (app/infra metrics, open-source — no New Relic, no vendor lock-in).** `GET /metrics` is exposed by [`prometheus-fastapi-instrumentator`](https://github.com/trallnag/prometheus-fastapi-instrumentator) — one line in `create_app` gives HTTP RED metrics (request rate / error rate / latency-histogram → p95) for free. On top, `app/metrics.py` adds the domain signals: `runs_total{status,error_code}` (incremented at the single `finalize_run` funnel) and a `queue_depth` gauge (mirrored from the KEDA endpoint). The arq worker — a non-HTTP process — exposes its own `/metrics` via `start_http_server` so worker-side counters are scrapable too. The Helm chart annotates both pods (`prometheus.io/scrape`) for zero-CRD discovery. Extend with another `Counter`/`Gauge`/`Histogram` — that's the whole pattern.
 
 - **In-app metrics (our DB, the product/billing data plane).**
   - **Feedback:** `POST /runs/{id}/feedback` `{rating: up|down, comment?}` — thumbs up/down, one per (user, run). Stored in `FeedbackDB` (source of truth) and **mirrored to a Langfuse BOOLEAN score** (`user-thumbs`) when Langfuse is on.
   - **Usage:** a single `UsageCounter` callback (one integration point, not per-tool decorators) counts every tool/sub-agent/MCP call per run into `RunDB.tool_calls`.
   - **Stats:** `GET /stats` → `{questions_asked, reviews_given, thumbs_up, thumbs_down, top_tools}` per user — the foundation for a usage dashboard / billing.
 
-This is a minimal foundation, intended to extend (time ranges, charts, per-tool cost). New Relic APM (auto-instrumentation, zero hand-written metrics) is the planned ops-metrics layer.
+This is a minimal foundation, intended to extend (time ranges, charts, per-tool cost). Alerting/SLOs ride on the Prometheus metrics via Grafana (no extra code).

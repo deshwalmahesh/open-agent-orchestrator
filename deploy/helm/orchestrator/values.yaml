@@ -58,6 +58,7 @@ api:
 
 worker:
   replicaCount: 2              # baseline; KEDA overrides between min/max when enabled
+  metricsPort: 9100            # Prometheus scrape port for the (non-HTTP) worker process
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits: { cpu: "1", memory: 512Mi }

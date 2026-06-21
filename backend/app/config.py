@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     #   "queue"  — enqueue to an arq worker on Redis (prod: durable, bounded, crash-safe).
     run_executor: Literal["inline", "queue"] = "inline"
     worker_max_jobs: int = 10   # arq worker global concurrency cap = backpressure
+    worker_metrics_port: int = 9100  # arq worker exposes Prometheus /metrics here (non-HTTP process)
     run_timeout_s: int = 300    # per-run wall-clock cap (arq job_timeout)
     run_max_tries: int = 3      # arq max attempts (bounds crash redelivery)
     # Global load-shed: reject new runs with 503 once the arq backlog exceeds this

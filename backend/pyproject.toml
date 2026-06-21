@@ -33,6 +33,7 @@ dependencies = [
     "uvicorn[standard]>=0.48.0",
     "arq>=0.28.0",
     "langfuse>=3.0.0",
+    "prometheus-fastapi-instrumentator>=7.0.0",
 ]
 
 [dependency-groups]

@@ -15,6 +15,12 @@ spec:
       app.kubernetes.io/component: worker
   template:
     metadata:
+      annotations:
+        # Worker is not an HTTP server; app.metrics.start_worker_metrics_server exposes
+        # the Prometheus registry on this port so runs_total is scrapable on worker pods.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.worker.metricsPort }}"
+        prometheus.io/path: "/metrics"
       labels:
         {{- include "orchestrator.labels" . | nindent 8 }}
         app.kubernetes.io/component: worker
@@ -30,6 +36,12 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["uv", "run", "arq", "app.worker.WorkerSettings"]
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.worker.metricsPort }}
+          env:
+            - name: WORKER_METRICS_PORT
+              value: "{{ .Values.worker.metricsPort }}"
           envFrom:
             {{- include "orchestrator.envFrom" . | nindent 12 }}
           resources:

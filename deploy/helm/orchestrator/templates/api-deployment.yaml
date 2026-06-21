@@ -15,6 +15,11 @@ spec:
       app.kubernetes.io/component: api
   template:
     metadata:
+      annotations:
+        # Prometheus k8s service-discovery scrapes pods carrying these (no Operator/CRD needed).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.api.containerPort }}"
+        prometheus.io/path: "/metrics"
       labels:
         {{- include "orchestrator.labels" . | nindent 8 }}
         app.kubernetes.io/component: api

@@ -241,6 +241,11 @@ def create_app() -> FastAPI:
     app.include_router(runs_router)
     app.include_router(stats_router)
 
+    # Prometheus: auto HTTP RED metrics + our custom run/queue metrics at GET /metrics.
+    # MUST be exposed before the SPA catch-all below, or /{full_path} would swallow it.
+    from prometheus_fastapi_instrumentator import Instrumentator
+    Instrumentator().instrument(app).expose(app)
+
     # Serve built frontend in prod (Dockerfile copies dist → /app/static).
     # Mounted AFTER API routes so they always win. SPA fallback: unknown paths
     # return index.html and let React Router handle them client-side.

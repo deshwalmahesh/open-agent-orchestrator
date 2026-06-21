@@ -40,6 +40,10 @@ async def startup(ctx: dict) -> None:
     s = get_settings()
     configure_logging(s.log_level)
     log.info("worker.startup", max_jobs=s.worker_max_jobs, job_timeout=s.run_timeout_s)
+    # Expose Prometheus /metrics from this non-HTTP process so runs_total (incremented
+    # here in queue mode) is scrapable on worker pods. Best-effort.
+    from app.metrics import start_worker_metrics_server
+    start_worker_metrics_server(s.worker_metrics_port)
     try:
         saver, client = await build_checkpointer()
         set_checkpointer(saver)

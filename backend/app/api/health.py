@@ -53,6 +53,10 @@ async def queue_depth() -> dict[str, int]:
     except Exception as exc:
         log.warning("queue_depth.unavailable", error=str(exc))
         depth = 0
+    # Mirror to the Prometheus gauge — this endpoint is polled by KEDA, so the gauge
+    # stays fresh for Grafana without a separate scheduler. (Plain JSON above is for KEDA.)
+    from app.metrics import QUEUE_DEPTH
+    QUEUE_DEPTH.set(depth)
     return {"depth": depth}
 
 

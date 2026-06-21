@@ -14,6 +14,7 @@ from app.db.models import (
     RunEventDB, SkillDB, UserToolConfigDB,
 )
 from app.domain import utcnow
+from app.metrics import record_run
 
 
 async def create_agent(session: AsyncSession, *, user_id: UUID, name: str, config: dict) -> AgentDB:
@@ -358,6 +359,8 @@ async def finalize_run(
     row.error = error
     row.error_code = error_code
     await session.commit()
+    # Single funnel for run-outcome metrics: every terminal transition passes through here.
+    record_run(status, error_code)
 
 
 # ---- Messages -----------------------------------------------------------

@@ -118,52 +118,85 @@ docker-compose.yml                postgres + redis + backend + worker + mcp-samp
 
 ### System flow
 
+Queue mode (prod) shown below. `RUN_EXECUTOR=inline` runs the same `_execute` in the API process for single-box dev — identical code path, no worker.
+
 ```mermaid
 flowchart LR
-  subgraph FE["Frontend (React + ReactFlow + TanStack Query)"]
-    PG[/Pipelines list/]
-    CV[Canvas editor]
-    CH[Chat + SSE]
-    IN[Integrations]
-    PS[Personas / Skills]
+  %% ---- clients & channels ----
+  subgraph EDGE["Clients & channels"]
+    WEB[/"Web UI<br/>React + ReactFlow"/]
+    SLACK["Slack<br/>Socket Mode"]
+    WAPP["WhatsApp<br/>Twilio webhook"]
   end
 
-  subgraph BE["Backend (FastAPI + asyncio + LangGraph)"]
-    API[REST routers]
-    RS[run_service]
-    BA[build_agent_tree<br/>recursive ReAct, depth-4]
-    LL[ChatOpenAI / Anthropic<br/>Gemini / vLLM dispatch]
-    TR[Built-in tools<br/>+ MCP discovery]
-    SL[Slack Socket Mode<br/>single-owner bot]
-    WA[WhatsApp webhook<br/>per-user Twilio]
-    EM[RunEventEmitter<br/>SSE fan-out]
+  %% ---- API tier (stateless, scale on CPU) ----
+  subgraph API["API pods · FastAPI — HPA on CPU"]
+    GATE["POST /messages<br/>JWT · quota · concurrency · load-shed"]
+    ENQ["start_run → enqueue<br/>returns 202 in ms (never blocks on LLM)"]
+    SSE["GET /runs/:id/events<br/>SSE: DB backlog + live tail"]
+    MET1["GET /metrics"]
   end
 
-  subgraph DATA["Persistence"]
-    DB[("SQLAlchemy 2.0 async<br/>SQLite ↔ Postgres<br/>UserDB · AgentDB · ChatDB<br/>MessageDB · RunDB · RunEventDB<br/>PersonaDB · SkillDB · MCPServerDB<br/>ToolConfigDB")]
-    RD[(Redis<br/>within-run checkpointer)]
+  %% ---- shared Redis ----
+  subgraph REDIS["Redis (shared coordination)"]
+    Q[("arq queue · ZSET")]
+    PS[("pub/sub · run:{id}")]
+    CK[("checkpointer · dedup<br/>leader lock · quota counter")]
   end
 
-  FE -->|REST + SSE| API
-  API --> RS --> BA --> LL
-  BA --> TR
-  RS <-->|sessions| DB
-  RS --> EM -->|SSE backlog + live| FE
-  SL -->|inbound DM ⇒ ChatDB| RS
-  RS -->|reply ⇒ same thread| SL
-  WA -->|inbound webhook ⇒ ChatDB| RS
-  RS -->|async reply via REST| WA
-  BA -.checkpoint.-> RD
-  IN -->|connect/disconnect/active| API
-  PS -->|reusables attach to N pipelines| API
+  %% ---- worker tier (stateless, scale on queue depth) ----
+  subgraph WORK["Worker pods · arq — KEDA on queue depth"]
+    EX["execute_run → _execute<br/>idempotent · timeout · retry · breaker"]
+    TREE["build_agent_tree<br/>recursive ReAct, depth-4"]
+    LLM["LLM dispatch<br/>OpenAI / Anthropic / Gemini / vLLM"]
+    TOOLS["built-in tools · MCP · sub-agents"]
+    MET2["/metrics :9100"]
+  end
+
+  PG[("Postgres / SQLite<br/>secrets Fernet-encrypted at rest")]
+  LF["Langfuse<br/>(optional traces)"]
+  PROM["Prometheus → Grafana"]
+
+  WEB -->|REST| GATE
+  SLACK --> ENQ
+  WAPP --> ENQ
+  GATE --> ENQ
+  ENQ -->|enqueue _job_id=run_id| Q
+  Q -->|pull, bounded max_jobs| EX
+  EX --> TREE --> LLM
+  TREE --> TOOLS
+  EX <-->|sessions, none held over LLM| PG
+  EX -->|publish events| PS
+  PS -->|subscribe| SSE
+  SSE -->|SSE| WEB
+  EX -. checkpoint / counters .-> CK
+  ENQ -. dedup / leader / quota .-> CK
+  LLM -. traces .-> LF
+  TOOLS -. traces .-> LF
+  MET1 --> PROM
+  MET2 --> PROM
+
+  classDef edge fill:#dbeafe,stroke:#3b82f6,color:#1e3a8a;
+  classDef api fill:#dcfce7,stroke:#22c55e,color:#14532d;
+  classDef work fill:#ede9fe,stroke:#8b5cf6,color:#4c1d95;
+  classDef data fill:#fee2e2,stroke:#ef4444,color:#7f1d1d;
+  classDef store fill:#cffafe,stroke:#0891b2,color:#155e75;
+  classDef obs fill:#fef9c3,stroke:#ca8a04,color:#713f12;
+
+  class WEB,SLACK,WAPP edge;
+  class GATE,ENQ,SSE,MET1 api;
+  class EX,TREE,LLM,TOOLS,MET2 work;
+  class Q,PS,CK data;
+  class PG store;
+  class LF,PROM obs;
 ```
 
 ### Data model (multi-user → multi-pipeline → multi-chat)
 
 ```mermaid
 flowchart TD
-  U["UserDB<br/>(JWT identity + optional slack_user_id<br/>+ optional Twilio WhatsApp creds)"]
-  A1["AgentDB<br/>(root = pipeline)"]
+  U["UserDB<br/>(JWT identity · plan · slack_user_id<br/>· Twilio creds — tokens encrypted at rest)"]
+  A1["AgentDB<br/>(root = pipeline · config encrypted)"]
   A2["AgentDB<br/>(sub-agent)"]
   A3["AgentDB<br/>(sub-agent — shared)"]
   CH1["ChatDB<br/>channel='web'"]
@@ -171,9 +204,10 @@ flowchart TD
   CH4["ChatDB<br/>channel='whatsapp'<br/>external_thread_id=whatsapp:+1234"]
   CH3["ChatDB<br/>channel='web'"]
   M["MessageDB<br/>(append-only, full audit)"]
-  R["RunDB + RunEventDB<br/>(status, tokens, SSE backlog)"]
+  R["RunDB + RunEventDB<br/>(status · tokens · cost · tool_calls<br/>· error_code · SSE backlog)"]
+  FB["FeedbackDB<br/>(thumbs ± comment,<br/>one per user+run)"]
   P["PersonaDB / SkillDB<br/>(account-scoped, attach to N agents)"]
-  MCP["MCPServerDB / ToolConfigDB<br/>(per-user creds, validated pre-save)"]
+  MCP["MCPServerDB / UserToolConfigDB<br/>(per-user creds — encrypted, validated pre-save)"]
 
   U -- owns N --> A1
   U -- owns N --> A2
@@ -188,8 +222,24 @@ flowchart TD
   CH2 -- has many --> M
   CH1 -- triggers --> R
   CH2 -- triggers --> R
+  R -. rated by .- FB
+  U -. leaves .- FB
   A1 -. uses .- P
   A1 -. uses .- MCP
+
+  classDef user fill:#dbeafe,stroke:#3b82f6,color:#1e3a8a;
+  classDef agent fill:#dcfce7,stroke:#22c55e,color:#14532d;
+  classDef chat fill:#ede9fe,stroke:#8b5cf6,color:#4c1d95;
+  classDef run fill:#fee2e2,stroke:#ef4444,color:#7f1d1d;
+  classDef reuse fill:#fef9c3,stroke:#ca8a04,color:#713f12;
+  classDef fb fill:#cffafe,stroke:#0891b2,color:#155e75;
+
+  class U user;
+  class A1,A2,A3 agent;
+  class CH1,CH2,CH3,CH4 chat;
+  class M,R run;
+  class P,MCP reuse;
+  class FB fb;
 ```
 
 Key relationships:

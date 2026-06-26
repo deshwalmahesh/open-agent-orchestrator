@@ -18,7 +18,7 @@ from uuid import UUID
 import structlog
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
-from app.db.repos import insert_event
+from app.db.repos import insert_event, max_event_seq
 from app.domain import EventType, RunEvent, utcnow
 from app.redis_client import get_redis
 
@@ -36,9 +36,17 @@ class RunEventEmitter:
         self.run_id = run_id
         self._session_factory = session_factory
         self._seq = 0
+        self._seeded = False
         self.queue: asyncio.Queue[RunEvent | None] = asyncio.Queue()
 
     async def emit(self, event_type: EventType, data: dict[str, Any] | None = None) -> None:
+        # Seed seq from any events already persisted for this run, so a second emitter on
+        # the same run (after a human-in-the-loop resume, or a worker restart mid-run)
+        # continues the sequence instead of colliding on the (run_id, seq) unique key.
+        if not self._seeded:
+            async with self._session_factory() as session:
+                self._seq = await max_event_seq(session, run_id=self.run_id)
+            self._seeded = True
         self._seq += 1
         payload = data or {}
         event = RunEvent(run_id=self.run_id, seq=self._seq, ts=utcnow(), type=event_type, data=payload)

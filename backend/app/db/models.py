@@ -136,7 +136,9 @@ class RunDB(Base):
     agent_id: Mapped[UUID | None] = mapped_column(
         Uuid, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True
     )
-    # Lifecycle: queued → running → succeeded | failed
+    # Lifecycle: queued → running → (awaiting_human → running)* → succeeded | failed.
+    # awaiting_human = paused on a human-in-the-loop interrupt; resumable, intentionally
+    # long-lived (NOT reaped by the orphan reconciler, NOT counted as an active run).
     status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -148,6 +150,11 @@ class RunDB(Base):
     # Per-run tool/sub-agent call counts, e.g. {"web_search": 3, "ResearchBot": 1}.
     # Populated by the UsageCounter callback; aggregated per-user for usage stats.
     tool_calls: Mapped[dict] = mapped_column(JSON, default=dict)
+    # HIL pause state. interrupt = the pending HITLRequest (action_requests + review_configs)
+    # to show the human; NULL unless status == awaiting_human. partial_tokens accumulates
+    # usage across pause/resume cycles so the final total stays honest.
+    interrupt: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    partial_tokens: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class MessageDB(Base):

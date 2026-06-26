@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import dataclass
 from datetime import timedelta
 from io import BytesIO
 from uuid import UUID
@@ -20,6 +21,7 @@ from uuid import UUID
 import structlog
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.errors import GraphRecursionError
+from langgraph.types import Command
 from pypdf import PdfReader
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,9 +33,12 @@ from app.db.repos import (
     count_active_runs,
     create_run,
     finalize_run,
+    get_awaiting_run_for_chat,
     insert_message,
     list_messages,
     list_tool_configs,
+    mark_run_resumed,
+    pause_run_for_human,
     run_has_user_message,
 )
 from app.domain import AgentConfig, LLMConfig, utcnow
@@ -209,20 +214,196 @@ async def _finalize_failure(session_factory, emitter, run_id: UUID, info) -> Non
     )
 
 
-async def _execute(run_id: UUID, chat_id: UUID, user_text: str, files: list[dict] | None = None) -> None:
-    """The actual run. Runs inline (asyncio.create_task) or in an arq worker.
+def _merge_usage(a: dict, b: dict) -> dict:
+    """Sum token usage across legs (pause/resume accumulates into RunDB.partial_tokens)."""
+    return {
+        k: (a.get(k, 0) or 0) + (b.get(k, 0) or 0)
+        for k in ("input_tokens", "output_tokens", "total_tokens")
+    }
 
-    Idempotent: the queue path is at-least-once, so a worker crash can redeliver
-    a run. We no-op if it already finished, and guard the user-message insert so a
-    retry never double-writes or double-counts tokens."""
-    # Bind run_id so every log line for this run (inline or worker) carries it.
+
+def _pending_interrupt(snap) -> dict:
+    """First interrupt value off a paused graph state snapshot (the HITLRequest dict)."""
+    for task in snap.tasks:
+        for intr in getattr(task, "interrupts", None) or ():
+            return intr.value
+    return {}
+
+
+def _decisions_from_text(text: str, interrupt: dict) -> list[dict]:
+    """Map a free-text channel reply to one HITL decision PER pending action.
+
+    The middleware requires exactly one decision per interrupted tool call. ask_human is
+    answered on the tool's behalf (`respond`); a forced tool approval reads an affirmative
+    keyword as `approve`, anything else as `reject` (carrying the text as the reason)."""
+    affirmative = {"yes", "y", "approve", "approved", "ok", "okay", "go ahead", "proceed"}
+    decisions: list[dict] = []
+    for req in interrupt.get("action_requests", []):
+        if req.get("name") == "ask_human":
+            decisions.append({"type": "respond", "message": text})
+        elif text.strip().lower() in affirmative:
+            decisions.append({"type": "approve"})
+        else:
+            decisions.append({"type": "reject", "message": text})
+    return decisions
+
+
+@dataclass
+class _LegCtx:
+    """Everything _drive needs to run one agent leg (first turn or a resume) and finalize.
+    prior_tokens carries SUB-AGENT usage from earlier legs (root usage is cumulative in
+    the checkpointed messages, so only sub-agent tokens need accumulating across pauses)."""
+
+    run_id: UUID
+    chat_id: UUID
+    sender_id: str
+    user_id: str
+    cfg: AgentConfig
+    emitter: RunEventEmitter
+    prior_tokens: dict
+
+
+async def _compile_agent(cfg: AgentConfig, system_prompt: str, summary: str, tc: dict):
+    """Compile the run's agent tree: stitch the rolling summary into the prompt, apply any
+    per-user tool creds, and attach the root checkpointer. One funnel for first-run and
+    resume so the checkpointer/registry wiring can't drift. Returns (run_cfg, agent)."""
+    run_cfg = cfg.model_copy(update={"system_prompt": _effective_prompt(system_prompt, summary)})
+    user_registry = build_registry(tool_configs=tc) if tc else None
+    agent = await build_agent_tree(
+        run_cfg, session_factory=get_session_factory(), checkpointer=_CHECKPOINTER,
+        tool_registry=user_registry,
+    )
+    return run_cfg, agent
+
+
+async def _drive(agent, invoke_input, ctx: _LegCtx) -> None:
+    """Invoke one agent leg, then finalize / pause-for-human / finalize-failed.
+
+    Shared by first-run (_execute) and resume_run so the timeout, breaker, usage
+    accounting, pause detection, and failure taxonomy can't drift between them.
+    On a human-in-the-loop interrupt the run is left non-terminal (awaiting_human) with
+    its checkpoint held in Redis; a later resume_run picks it up on the same thread_id."""
+    run_id, chat_id, cfg, emitter = ctx.run_id, ctx.chat_id, ctx.cfg, ctx.emitter
+    session_factory = get_session_factory()
+    thread_cfg = {"configurable": {"thread_id": str(run_id)}}
+    sub_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    usage_token = _SUBAGENT_USAGE.set(sub_usage)
+    usage_counter = UsageCounter()  # standardized tool/sub-agent call capture (incl MCP)
+    lf_handler = get_handler()      # off-the-shelf Langfuse tracing (None if disabled)
+    callbacks = [usage_counter] + ([lf_handler] if lf_handler else [])
+    try:
+        # Per-run wall-clock cap OUTSIDE the retry, so a hung loop or stuck tool can't pin
+        # a worker (queue) or leak forever (inline). run_span pins the Langfuse trace id.
+        async with asyncio.timeout(get_settings().run_timeout_s):
+            with run_span(run_id):
+                result = await invoke_with_breaker(
+                    agent,
+                    invoke_input,
+                    config={
+                        "recursion_limit": max(2, cfg.limits.max_steps),
+                        **thread_cfg,
+                        "callbacks": callbacks,
+                        "metadata": {
+                            "langfuse_user_id": ctx.user_id,
+                            "langfuse_session_id": str(chat_id),
+                            "langfuse_tags": [cfg.llm.provider, get_settings().app_env],
+                        },
+                    },
+                    breaker_key=f"{cfg.llm.provider}:{cfg.llm.base_url}",
+                )
+
+        # Token accounting across pause/resume legs:
+        #  - root LLM usage lives in result["messages"], which is the CUMULATIVE
+        #    checkpointed history — so _extract_usage already spans every leg. Don't add
+        #    prior legs' root usage again or it double-counts.
+        #  - sub-agent usage is per-leg (collected in the _SUBAGENT_USAGE contextvar, reset
+        #    each leg) and is NOT in messages, so it must be accumulated across legs.
+        root_usage = _extract_usage(result["messages"])
+        cumulative_sub = _merge_usage(ctx.prior_tokens, sub_usage)
+        total = _merge_usage(root_usage, cumulative_sub)
+
+        # Paused on a human-in-the-loop interrupt? Persist the pending request + the
+        # cumulative sub-agent usage and stop here — DO NOT finalize. The next inbound
+        # answer resumes this run (root usage is recovered from the checkpoint).
+        # A pause is only possible WITH a checkpointer, and aget_state raises without one,
+        # so only inspect graph state when checkpointing is enabled (no-Redis runs skip it).
+        if _CHECKPOINTER is not None:
+            pending = _pending_interrupt(await agent.aget_state(thread_cfg))
+            if pending:
+                async with session_factory() as session:
+                    await pause_run_for_human(
+                        session, run_id=run_id, interrupt=pending, partial_tokens=cumulative_sub
+                    )
+                await emitter.emit("human.requested", {"request": pending})
+                log.info("run.awaiting_human", run_id=str(run_id))
+                return
+
+        final = result["messages"][-1]
+        reply = getattr(final, "content", "") or ""
+        cost = cost_for(cfg.llm.model, total)  # USD, from the static price table
+        async with session_factory() as session:
+            await insert_message(
+                session, chat_id=chat_id, run_id=run_id,
+                sender=ctx.sender_id, recipient="user", content=reply,
+            )
+            await finalize_run(
+                session, run_id=run_id, status="succeeded", total_tokens=total,
+                total_cost=cost, tool_calls=usage_counter.tool_calls,
+            )
+        # Meter the full run total once, at the terminal leg (best-effort; run committed).
+        await add_usage(ctx.user_id, total.get("total_tokens", 0))
+
+        await emitter.emit("agent.message", {"sender": ctx.sender_id, "content": reply})
+        await emitter.emit("run.finished", {"usage": total, "status": "succeeded"})
+        log.info("run.succeeded", run_id=str(run_id), tokens=total.get("total_tokens", 0))
+    except GraphRecursionError:
+        # Bounded step budget reached. Persist a clean reply so the chat isn't silent;
+        # run is marked failed so usage/billing accounting stays honest.
+        limit = cfg.limits.max_steps
+        log.warning("run.recursion_limit", run_id=str(run_id), limit=limit)
+        reply = (
+            f"I couldn't finish this within {limit} reasoning steps. "
+            f"Could you simplify the request or split it into smaller parts?"
+        )
+        async with session_factory() as session:
+            await insert_message(
+                session, chat_id=chat_id, run_id=run_id,
+                sender=ctx.sender_id, recipient="user", content=reply,
+            )
+            await finalize_run(
+                session, run_id=run_id, status="failed",
+                error=info_for(STEP_LIMIT).user_message, error_code=STEP_LIMIT,
+            )
+        await emitter.emit("agent.message", {"sender": ctx.sender_id, "content": reply})
+        await emitter.emit("run.finished", {"status": "failed", "error_code": STEP_LIMIT})
+    except TimeoutError:
+        # Our per-run wall-clock cap (asyncio.timeout). A builtin TimeoutError here is the
+        # run budget — provider timeouts surface as SDK-specific types.
+        log.warning("run.timeout", run_id=str(run_id), limit=get_settings().run_timeout_s)
+        await _finalize_failure(session_factory, emitter, run_id, info_for(RUN_TIMEOUT))
+    except asyncio.CancelledError:
+        # Cancellation is control flow (shutdown). Re-raise so arq can re-queue.
+        raise
+    except Exception as exc:  # noqa: BLE001 — top-level boundary; we log + persist
+        info = classify(exc)
+        log.exception("run.failed", run_id=str(run_id), error=str(exc), error_code=info.code)
+        await _finalize_failure(session_factory, emitter, run_id, info)
+    finally:
+        _SUBAGENT_USAGE.reset(usage_token)
+
+
+async def _execute(run_id: UUID, chat_id: UUID, user_text: str, files: list[dict] | None = None) -> None:
+    """The first leg of a run. Runs inline (asyncio.create_task) or in an arq worker.
+
+    Idempotent: the queue path is at-least-once, so a worker crash can redeliver a run.
+    We no-op if it already finished, and guard the user-message insert so a retry never
+    double-writes or double-counts tokens."""
     structlog.contextvars.bind_contextvars(run_id=str(run_id))
     log.info("run.start", run_id=str(run_id), chat_id=str(chat_id))
     session_factory = get_session_factory()
 
-    # Idempotency gate: if a prior attempt already reached a terminal state, this is
-    # a duplicate delivery — do nothing (don't re-emit, re-bill, or re-reply).
-    # Otherwise mark running (queued → running) so the lifecycle is observable.
+    # Idempotency gate: a duplicate delivery of a terminal run does nothing; otherwise
+    # mark running (queued → running) so the lifecycle is observable.
     async with session_factory() as _s:
         _existing = await _s.get(RunDB, run_id)
         if _existing is not None and _existing.status in ("succeeded", "failed"):
@@ -234,148 +415,94 @@ async def _execute(run_id: UUID, chat_id: UUID, user_text: str, files: list[dict
 
     emitter = RunEventEmitter(run_id, session_factory)
     EMITTERS[run_id] = emitter
-
     try:
         await emitter.emit("run.started", {"chat_id": str(chat_id), "input": user_text})
-
-        # Phase 1: all pre-LLM DB work in one short-lived session, then close.
-        # Holding a session across the LLM round-trip would pin a connection from the
-        # pool for the duration of the call (60s+ with retries).
-        async with session_factory() as session:
-            chat, cfg, system_prompt = await _load_chat_and_agent(session, chat_id=chat_id)
-            # sender_id captured here so we don't touch chat.agent_id after session close
-            # (scalar columns survive close because expire_on_commit=False, but explicit is safer)
-            sender_id = str(chat.agent_id)
-            user_id = str(chat.user_id)  # for Langfuse trace attribution
-
-            file_text, image_blocks = _process_files(files or [])
-            full_user_text = f"{file_text}\n\n{user_text}".strip() if file_text else user_text
-
-            # Guarded against duplicate delivery: only insert the user turn once.
-            if not await run_has_user_message(session, run_id=run_id):
-                await insert_message(
-                    session, chat_id=chat_id, run_id=run_id, sender="user", content=full_user_text
-                )
-            summary, verbatim = await _resolve_context(session, chat, cfg)
-
-            user_configs = await list_tool_configs(session, user_id=chat.user_id)
-            tc = {r.tool_name: r.config for r in user_configs}
-
-        # Phase 2: build LangChain messages + agent tree + LLM call — no session held.
-        lc_messages = _to_lc_messages(verbatim)
-        # For multimodal: replace the last HumanMessage with image content blocks
-        if image_blocks and lc_messages:
-            last_msg = lc_messages[-1]
-            if hasattr(last_msg, "content") and isinstance(last_msg.content, str):
-                lc_messages[-1] = HumanMessage(content=[
-                    {"type": "text", "text": last_msg.content},
-                    *image_blocks,
-                ])
-        user_registry = build_registry(tool_configs=tc) if tc else None
-        run_cfg = cfg.model_copy(update={"system_prompt": _effective_prompt(system_prompt, summary)})
-        agent = await build_agent_tree(
-            run_cfg, session_factory=session_factory, checkpointer=_CHECKPOINTER,
-            tool_registry=user_registry,
-        )
-        # thread_id = run_id (not chat_id) — each run gets its own checkpoint so
-        # within-run graph state doesn't conflict with our DB-based cross-turn history.
-        # Sub-agent token usage is collected via _SUBAGENT_USAGE contextvar (root's
-        # result["messages"] only sees ToolMessages for sub-agent calls, no usage).
-        sub_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-        usage_token = _SUBAGENT_USAGE.set(sub_usage)
-        usage_counter = UsageCounter()  # standardized tool/sub-agent call capture (incl MCP)
-        lf_handler = get_handler()      # off-the-shelf Langfuse tracing (None if disabled)
-        callbacks = [usage_counter] + ([lf_handler] if lf_handler else [])
         try:
-            # Per-run wall-clock cap OUTSIDE the retry, so a hung multi-step loop or
-            # stuck tool can't pin a worker (queue) or leak forever (inline). arq's
-            # job_timeout only covers queue mode; this covers both. run_span pins the
-            # Langfuse trace id to the run (nullcontext when Langfuse is off).
-            async with asyncio.timeout(get_settings().run_timeout_s):
-                with run_span(run_id):
-                    result = await invoke_with_breaker(
-                        agent,
-                        {"messages": lc_messages},
-                        config={
-                            "recursion_limit": max(2, cfg.limits.max_steps),
-                            "configurable": {"thread_id": str(run_id)},
-                            "callbacks": callbacks,  # one slot: usage counter + Langfuse
-                            "metadata": {
-                                "langfuse_user_id": user_id,
-                                "langfuse_session_id": str(chat_id),
-                                "langfuse_tags": [cfg.llm.provider, get_settings().app_env],
-                            },
-                        },
-                        # Breaker keyed by root provider endpoint (sub-agents may differ;
-                        # the common case is one provider per run).
-                        breaker_key=f"{cfg.llm.provider}:{cfg.llm.base_url}",
+            # Phase 1: pre-LLM DB work in one short-lived session, then close (don't pin a
+            # pool connection across the LLM round-trip).
+            async with session_factory() as session:
+                chat, cfg, system_prompt = await _load_chat_and_agent(session, chat_id=chat_id)
+                sender_id = str(chat.agent_id)
+                user_id = str(chat.user_id)
+
+                file_text, image_blocks = _process_files(files or [])
+                full_user_text = f"{file_text}\n\n{user_text}".strip() if file_text else user_text
+
+                # Guarded against duplicate delivery: only insert the user turn once.
+                if not await run_has_user_message(session, run_id=run_id):
+                    await insert_message(
+                        session, chat_id=chat_id, run_id=run_id, sender="user", content=full_user_text
                     )
-        finally:
-            _SUBAGENT_USAGE.reset(usage_token)
+                summary, verbatim = await _resolve_context(session, chat, cfg)
+                user_configs = await list_tool_configs(session, user_id=chat.user_id)
+                tc = {r.tool_name: r.config for r in user_configs}
 
-        final = result["messages"][-1]
-        reply = getattr(final, "content", "") or ""
-        usage = _extract_usage(result["messages"])
-        for k in usage:
-            usage[k] += sub_usage.get(k, 0)
-        cost = cost_for(cfg.llm.model, usage)  # USD, from the static price table
+            # Phase 2: build LangChain messages + agent tree — no session held.
+            lc_messages = _to_lc_messages(verbatim)
+            if image_blocks and lc_messages:  # multimodal: attach image blocks to last turn
+                last_msg = lc_messages[-1]
+                if hasattr(last_msg, "content") and isinstance(last_msg.content, str):
+                    lc_messages[-1] = HumanMessage(content=[
+                        {"type": "text", "text": last_msg.content},
+                        *image_blocks,
+                    ])
+            run_cfg, agent = await _compile_agent(cfg, system_prompt, summary, tc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — prep boundary (bad config, DB, build)
+            info = classify(exc)
+            log.exception("run.prep_failed", run_id=str(run_id), error=str(exc), error_code=info.code)
+            await _finalize_failure(session_factory, emitter, run_id, info)
+            return
 
-        # Phase 3: post-LLM persistence — fresh session, sender_id captured in Phase 1.
-        async with session_factory() as session:
-            await insert_message(
-                session,
-                chat_id=chat_id,
-                run_id=run_id,
-                sender=sender_id,
-                recipient="user",
-                content=reply,
-            )
-            await finalize_run(
-                session, run_id=run_id, status="succeeded", total_tokens=usage,
-                total_cost=cost, tool_calls=usage_counter.tool_calls,
-            )
-        # Meter against the user's daily quota (best-effort; the run is already committed).
-        await add_usage(user_id, usage.get("total_tokens", 0))
+        # thread_id = run_id so within-run graph state is isolated from cross-turn history.
+        ctx = _LegCtx(run_id, chat_id, sender_id, user_id, run_cfg, emitter, {})
+        await _drive(agent, {"messages": lc_messages}, ctx)
+    finally:
+        await emitter.close()
+        EMITTERS.pop(run_id, None)
 
-        await emitter.emit("agent.message", {"sender": sender_id, "content": reply})
-        await emitter.emit("run.finished", {"usage": usage, "status": "succeeded"})
-        log.info("run.succeeded", run_id=str(run_id), tokens=usage.get("total_tokens", 0))
-    except GraphRecursionError:
-        # Bounded step budget reached. Don't leave the chat silent — persist a clean
-        # reply so the user sees something actionable. Run is still marked failed
-        # so usage/billing accounting stays honest.
-        limit = cfg.limits.max_steps  # captured during Phase 1
-        log.warning("run.recursion_limit", run_id=str(run_id), limit=limit)
-        reply = (
-            f"I couldn't finish this within {limit} reasoning steps. "
-            f"Could you simplify the request or split it into smaller parts?"
-        )
-        async with session_factory() as session:
-            await insert_message(
-                session, chat_id=chat_id, run_id=run_id,
-                sender=sender_id, recipient="user", content=reply,
-            )
-            await finalize_run(
-                session, run_id=run_id, status="failed",
-                error=info_for(STEP_LIMIT).user_message, error_code=STEP_LIMIT,
-            )
-        await emitter.emit("agent.message", {"sender": sender_id, "content": reply})
-        await emitter.emit("run.finished", {"status": "failed", "error_code": STEP_LIMIT})
-    except TimeoutError:
-        # Our per-run wall-clock cap (asyncio.timeout). A builtin TimeoutError at this
-        # boundary is the run budget — provider timeouts surface as SDK-specific types.
-        log.warning("run.timeout", run_id=str(run_id), limit=get_settings().run_timeout_s)
-        await _finalize_failure(session_factory, emitter, run_id, info_for(RUN_TIMEOUT))
-    except asyncio.CancelledError:
-        # Cancellation is control flow (shutdown). Re-raise so arq can re-queue
-        # (pessimistic execution); the startup reconciler is the final backstop.
-        raise
-    except Exception as exc:  # noqa: BLE001 — top-level boundary; we log + persist
-        # Centralized failure taxonomy: classify() picks the user message + machine code.
-        # Raw exception goes to logs only (may carry detail we don't surface to the user).
-        info = classify(exc)
-        log.exception("run.failed", run_id=str(run_id), error=str(exc), error_code=info.code)
-        await _finalize_failure(session_factory, emitter, run_id, info)
+
+async def resume_run(run_id: UUID, decisions: list[dict]) -> None:
+    """Resume a run paused on a human-in-the-loop interrupt with the human's decisions.
+
+    Idempotent: if the run isn't (still) awaiting_human this is a no-op (double delivery,
+    or it was already resumed/cancelled). Rebuilds the same agent so the Redis checkpoint
+    replays on the same thread_id, then feeds the decisions via Command(resume=...)."""
+    structlog.contextvars.bind_contextvars(run_id=str(run_id))
+    session_factory = get_session_factory()
+
+    async with session_factory() as session:
+        row = await mark_run_resumed(session, run_id=run_id)
+        if row is None:
+            log.info("run.resume_skip", run_id=str(run_id))
+            return
+        chat_id = row.chat_id
+        prior_tokens = dict(row.partial_tokens or {})
+
+    emitter = RunEventEmitter(run_id, session_factory)
+    EMITTERS[run_id] = emitter
+    try:
+        await emitter.emit("human.responded", {"decisions": decisions})
+        try:
+            async with session_factory() as session:
+                chat, cfg, system_prompt = await _load_chat_and_agent(session, chat_id=chat_id)
+                sender_id = str(chat.agent_id)
+                user_id = str(chat.user_id)
+                summary = chat.summary or ""  # use the stored summary; don't re-summarize on resume
+                user_configs = await list_tool_configs(session, user_id=chat.user_id)
+                tc = {r.tool_name: r.config for r in user_configs}
+            run_cfg, agent = await _compile_agent(cfg, system_prompt, summary, tc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — resume prep boundary
+            info = classify(exc)
+            log.exception("run.resume_prep_failed", run_id=str(run_id), error=str(exc))
+            await _finalize_failure(session_factory, emitter, run_id, info)
+            return
+
+        ctx = _LegCtx(run_id, chat_id, sender_id, user_id, run_cfg, emitter, prior_tokens)
+        await _drive(agent, Command(resume={"decisions": decisions}), ctx)
     finally:
         await emitter.close()
         EMITTERS.pop(run_id, None)
@@ -428,6 +555,23 @@ async def _check_load_shed() -> None:
         raise QueueFull(f"backlog {depth} >= cap {s.max_queue_depth}")
 
 
+async def _dispatch(coro_factory, *, job_name: str, job_args: tuple, log_id: str, job_id: str | None = None) -> None:
+    """Run work via the executor seam: an arq queue job (durable, bounded) or an inline
+    asyncio task with crash-safe _PENDING tracking. The queue path falls back to inline if
+    the pool is unavailable so a Redis blip can't drop the turn (logged loudly). The worker
+    request_id is carried as the last positional so worker logs/traces correlate."""
+    if get_settings().run_executor == "queue" and _ARQ_POOL is not None:
+        request_id = structlog.contextvars.get_contextvars().get("request_id")
+        kwargs = {"_job_id": job_id} if job_id else {}
+        await _ARQ_POOL.enqueue_job(job_name, *job_args, request_id, **kwargs)
+        return
+    if get_settings().run_executor == "queue":
+        log.error("run.queue_unavailable_inline_fallback", run_id=log_id)
+    task = asyncio.create_task(coro_factory())
+    _PENDING.add(task)
+    task.add_done_callback(_PENDING.discard)
+
+
 async def start_run(
     session: AsyncSession, *, chat_id: UUID, user_text: str, files: list[dict] | None = None
 ) -> UUID:
@@ -440,6 +584,16 @@ async def start_run(
     chat = await session.get(ChatDB, chat_id)
     if chat is None:
         raise ValueError(f"chat not found: {chat_id}")
+
+    # If a run on this chat is paused waiting for a human, THIS message is the answer:
+    # resume that run instead of starting a new one. Routed before fairness checks — a
+    # human's reply to a pending question must never be rejected for concurrency/quota.
+    paused = await get_awaiting_run_for_chat(session, chat_id=chat_id)
+    if paused is not None:
+        decisions = _decisions_from_text(user_text, paused.interrupt or {})
+        await _dispatch_resume(paused.id, decisions)
+        return paused.id
+
     # Per-user fairness (concurrency + daily token quota) first, then global shed —
     # all before creating the row so we never persist a run we're about to reject.
     user = await session.get(UserDB, chat.user_id)
@@ -448,22 +602,27 @@ async def start_run(
     await enforce_quota(chat.user_id, plan)
     await _check_load_shed()
     run = await create_run(session, chat_id=chat_id, agent_id=chat.agent_id)
-
-    if get_settings().run_executor == "queue" and _ARQ_POOL is not None:
-        # Carry the request_id across the queue so worker logs + Langfuse traces tie
-        # back to the originating HTTP request. _job_id=run_id dedups duplicate enqueues.
-        request_id = structlog.contextvars.get_contextvars().get("request_id")
-        await _ARQ_POOL.enqueue_job(
-            "execute_run", str(run.id), str(chat_id), user_text, files or [], request_id,
-            _job_id=str(run.id),
-        )
-    else:
-        if get_settings().run_executor == "queue":
-            log.error("run.queue_unavailable_inline_fallback", run_id=str(run.id))
-        task = asyncio.create_task(_execute(run.id, chat_id, user_text, files=files or []))
-        _PENDING.add(task)
-        task.add_done_callback(_PENDING.discard)
+    # _job_id=run_id dedups duplicate enqueues of the same run.
+    await _dispatch(
+        lambda: _execute(run.id, chat_id, user_text, files=files or []),
+        job_name="execute_run",
+        job_args=(str(run.id), str(chat_id), user_text, files or []),
+        log_id=str(run.id),
+        job_id=str(run.id),
+    )
     return run.id
+
+
+async def _dispatch_resume(run_id: UUID, decisions: list[dict]) -> None:
+    """Dispatch a resume through the executor seam. No fixed _job_id: a run can pause→resume
+    several times and a stable id would let arq's result cache refuse the second resume —
+    correctness comes from the atomic awaiting_human→running transition (mark_run_resumed)."""
+    await _dispatch(
+        lambda: resume_run(run_id, decisions),
+        job_name="resume_run_job",
+        job_args=(str(run_id), decisions),
+        log_id=str(run_id),
+    )
 
 
 async def drain_pending(timeout: float = 60.0) -> None:

@@ -66,6 +66,21 @@ class Limits(_Base):
     max_steps: int = 8
 
 
+class ForcedRule(_Base):
+    """A deterministic edge the LLM cannot skip, enforced by ForcedChainMiddleware.
+
+    - require_before_finish: `target` (a tool/sub-agent name) MUST have been called
+      before the agent is allowed to emit a final answer. Use for "creator -> must-have
+      validator before returning".
+    - force_after: once `target` (tool A) produces a result, `then` (tool B) is forced
+      as the next call. Use for "tool A -> tool B" chains.
+    """
+
+    kind: Literal["require_before_finish", "force_after"]
+    target: str  # required tool/sub-agent, OR the trigger tool A
+    then: str | None = None  # force_after: the tool B to run after target
+
+
 class ChannelBinding(_Base):
     channel: Literal["slack", "web", "whatsapp"]
     external_id: str | None = None  # e.g., slack channel id
@@ -85,6 +100,13 @@ class AgentConfig(_Base):
     skills: list[UUID] = Field(default_factory=list)  # SkillDB UUIDs — content injected into prompt at runtime
     mcp_servers: list[UUID] = Field(default_factory=list)  # MCPServerDB UUIDs — tools discovered at runtime
     channels: list[ChannelBinding] = Field(default_factory=list)
+    # Human-in-the-loop. ask_human_enabled adds the flexible `ask_human` tool the agent
+    # calls at will; hil_tools force a pause for human review whenever the agent calls
+    # one of those tools. Both pause the run (status awaiting_human) until a human resumes.
+    # Only enforced at the root agent (depth 0) — that's where the checkpointer lives.
+    ask_human_enabled: bool = False
+    hil_tools: list[str] = Field(default_factory=list)
+    forced_rules: list[ForcedRule] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -99,6 +121,7 @@ EventType = Literal[
     "usage",
     "guardrail.blocked",
     "human.requested",
+    "human.responded",
     "run.error",
     "run.finished",
 ]

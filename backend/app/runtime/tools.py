@@ -79,6 +79,22 @@ def pdf_to_text(path: str) -> str:
 
 
 @tool
+def ask_human(question: str) -> str:
+    """Ask a human a question and wait for their answer before continuing.
+
+    USE WHEN: you genuinely need a decision, approval, or clarification that only a
+    person can give (ambiguous request, missing info, an action that needs sign-off).
+    The run PAUSES until the human replies; their reply is fed back to you as this
+    tool's result. Ask one clear, specific question.
+    DO NOT USE FOR: things you can answer yourself or look up with another tool.
+
+    Note: this tool never runs on its own — when human-in-the-loop is enabled the
+    human's reply is substituted as the result. This fallback string only appears if
+    it is somehow invoked without a human review configured."""
+    return "[No human answer was provided.]"
+
+
+@tool
 async def fetch_page(url: str) -> str:
     """Fetch the raw HTML of a single URL (10s timeout, follows redirects).
 
@@ -142,6 +158,7 @@ DISPLAY_NAMES: dict[str, str] = {
     "pdf_to_text": "PDF → Text",
     "python_sandbox": "Python Sandbox",
     "fetch_page": "Fetch Page",
+    "ask_human": "Ask Human",
 }
 
 
@@ -155,6 +172,7 @@ def build_registry(*, tool_configs: dict[str, dict] | None = None) -> dict[str, 
         "pdf_to_text": pdf_to_text,
         "python_sandbox": python_sandbox,
         "fetch_page": fetch_page,
+        "ask_human": ask_human,
     }
     configs = tool_configs or {}
     tavily_key = configs.get("web_search", {}).get("api_key")

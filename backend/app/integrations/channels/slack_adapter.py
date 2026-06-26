@@ -82,11 +82,13 @@ async def _find_or_create_chat(
 
 
 async def wait_for_reply(run_id: UUID, *, timeout: float = 60.0) -> tuple[str, str | None]:
-    """Poll the run status until terminal; return (status, reply_text).
+    """Poll the run status until terminal OR paused-for-human; return (status, text).
 
-    status ∈ {"succeeded", "failed", "timeout"}; reply_text is the agent's text
-    (may be empty string on a succeeded run, None on failure/timeout). The caller
-    decides how to present empty vs failed vs timeout — they're distinct UX cases.
+    status ∈ {"succeeded", "failed", "awaiting_human", "timeout"}; text is the agent's
+    reply (succeeded), the human-in-the-loop question (awaiting_human), or None
+    (failed/timeout). awaiting_human is a stop condition, not a timeout: the run is
+    waiting indefinitely and the channel should deliver the question now — the user's
+    next message resumes the run (start_run routes it).
     """
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
@@ -94,6 +96,8 @@ async def wait_for_reply(run_id: UUID, *, timeout: float = 60.0) -> tuple[str, s
     while loop.time() < deadline:
         async with sf() as session:
             run = await session.get(RunDB, run_id)
+            if run is not None and run.status == "awaiting_human":
+                return ("awaiting_human", _interrupt_question(run.interrupt or {}))
             if run is not None and run.status in ("succeeded", "failed"):
                 if run.status == "failed":
                     return ("failed", run.error)
@@ -106,9 +110,28 @@ async def wait_for_reply(run_id: UUID, *, timeout: float = 60.0) -> tuple[str, s
     return ("timeout", None)
 
 
+def _interrupt_question(interrupt: dict) -> str:
+    """Human-readable prompt from a pending HITLRequest, for delivery on a chat channel.
+    Prefers ask_human's question; otherwise the action's description (set by the HITL
+    middleware). Joins multiple pending actions so the user sees everything to decide."""
+    parts: list[str] = []
+    for req in interrupt.get("action_requests", []):
+        if req.get("name") == "ask_human":
+            parts.append(str(req.get("args", {}).get("question", "")).strip())
+        elif req.get("description"):
+            parts.append(str(req["description"]).strip())
+        else:
+            parts.append(f"Approve action `{req.get('name')}` with args {req.get('args', {})}?")
+    return "\n\n".join(p for p in parts if p) or "I need your input to continue."
+
+
 def format_reply(status: str, reply: str | None) -> str:
     """Map a (status, reply) from wait_for_reply to channel-facing text. Shared by
     Slack + WhatsApp so the failed/timeout/empty UX can't drift between channels."""
+    if status == "awaiting_human":
+        # The run paused to ask the human something. Deliver the question; the user's
+        # next message in this thread resumes the run.
+        return reply or "I need your input to continue."
     if status == "timeout":
         return "Still working on that — taking longer than usual. Try again in a moment."
     if status == "failed":

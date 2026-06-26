@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -363,6 +363,56 @@ async def finalize_run(
     record_run(status, error_code)
 
 
+async def pause_run_for_human(
+    session: AsyncSession, *, run_id: UUID, interrupt: dict, partial_tokens: dict
+) -> None:
+    """Mark a run awaiting_human and stash the pending HITL request + usage so far.
+
+    The run is intentionally left non-terminal (no ended_at): it holds its LangGraph
+    checkpoint in Redis until a human resumes it. partial_tokens carries usage across
+    the pause so the final total stays honest."""
+    row = await session.get(RunDB, run_id)
+    if row is None:
+        return
+    row.status = "awaiting_human"
+    row.interrupt = interrupt
+    row.partial_tokens = partial_tokens
+    await session.commit()
+
+
+async def get_awaiting_run_for_chat(session: AsyncSession, *, chat_id: UUID) -> RunDB | None:
+    """The chat's run currently paused on a human-in-the-loop interrupt, if any.
+
+    A chat has at most one paused run at a time (the agent can't start a new turn while
+    one is waiting), so the next inbound message routes to resuming THIS run. Newest first
+    defensively in case an old paused row was ever left behind."""
+    stmt = (
+        select(RunDB)
+        .where(RunDB.chat_id == chat_id, RunDB.status == "awaiting_human")
+        .order_by(RunDB.started_at.desc())
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def mark_run_resumed(session: AsyncSession, *, run_id: UUID) -> RunDB | None:
+    """Atomically flip awaiting_human → running and clear the pending interrupt.
+
+    Returns the row if THIS call won the transition, else None (already resumed, terminal,
+    or missing). The conditional UPDATE is the concurrency guard: if two resumes of the
+    same paused run race, only one matches `status == 'awaiting_human'` and drives the
+    checkpoint — the other gets rowcount 0 and no-ops."""
+    result = await session.execute(
+        update(RunDB)
+        .where(RunDB.id == run_id, RunDB.status == "awaiting_human")
+        .values(status="running", interrupt=None)
+    )
+    await session.commit()
+    if result.rowcount == 0:
+        return None
+    return await session.get(RunDB, run_id)
+
+
 # ---- Messages -----------------------------------------------------------
 
 async def insert_message(
@@ -410,6 +460,14 @@ async def insert_event(
 ) -> None:
     session.add(RunEventDB(run_id=run_id, seq=seq, type=event_type, data=data))
     await session.commit()
+
+
+async def max_event_seq(session: AsyncSession, *, run_id: UUID) -> int:
+    """Highest event seq already persisted for a run (0 if none). Lets a second emitter
+    (e.g. after a human-in-the-loop resume) continue the sequence instead of colliding on
+    the (run_id, seq) unique key."""
+    stmt = select(func.max(RunEventDB.seq)).where(RunEventDB.run_id == run_id)
+    return (await session.execute(stmt)).scalar() or 0
 
 
 async def list_events(

@@ -29,7 +29,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.db.models import AgentDB, MCPServerDB
 from app.domain import AgentConfig
 from app.llm import build_chat_model, invoke_with_retry
-from app.runtime.tools import get_tools
+from app.runtime.middleware import build_middleware
+from app.runtime.tools import REGISTRY, get_tools
 
 log = structlog.get_logger()
 
@@ -111,6 +112,10 @@ async def build_agent_tree(
         raise ValueError(f"agent nesting depth {depth} exceeds cap {MAX_AGENT_DEPTH}")
 
     base_tools = get_tools(cfg.tools, registry=tool_registry)
+    # The flexible HIL tool is added by a flag, not by listing it in cfg.tools, so it can't
+    # be forgotten when ask_human_enabled is set. Dedupe in case it's also listed explicitly.
+    if cfg.ask_human_enabled and not any(t.name == "ask_human" for t in base_tools):
+        base_tools = [*base_tools, REGISTRY["ask_human"]]
 
     # Resolve MCP server rows + sub-agent config rows in one short-lived session, then close.
     # Network calls (MCP get_tools) happen AFTER the session closes so we never pin a
@@ -158,9 +163,21 @@ async def build_agent_tree(
         model=cfg.llm.model,
         tools=[t.name for t in all_tools],
     )
+    # Middleware (HIL + forced chains) only at the root: it relies on the checkpointer
+    # for interrupts, and the checkpointer is attached only at depth 0.
+    middleware = build_middleware(cfg, all_tools) if depth == 0 else []
+    # Fail fast: HIL needs a checkpointer to pause/resume. Building a HIL agent without one
+    # would run and then blow up mid-flight on interrupt() with a confusing error. Reject
+    # loudly here instead (forced chains don't need a checkpointer, so they're unaffected).
+    if depth == 0 and checkpointer is None and (cfg.ask_human_enabled or cfg.hil_tools):
+        raise ValueError(
+            "human-in-the-loop (ask_human_enabled/hil_tools) requires a checkpointer, "
+            "but none is configured (REDIS_URL unset or Redis unreachable)"
+        )
     return create_agent(
         model=build_chat_model(cfg.llm),
         tools=all_tools,
         system_prompt=cfg.system_prompt,
+        middleware=middleware,
         checkpointer=checkpointer if depth == 0 else None,
     )

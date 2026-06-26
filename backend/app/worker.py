@@ -17,7 +17,7 @@ from arq.connections import RedisSettings
 from app.config import get_settings
 from app.logging import configure_logging
 from app.runtime.checkpointer import build_checkpointer
-from app.services.run_service import _execute, set_checkpointer
+from app.services.run_service import _execute, resume_run, set_checkpointer
 
 log = structlog.get_logger()
 
@@ -32,6 +32,18 @@ async def execute_run(
     structlog.contextvars.bind_contextvars(request_id=request_id or "-")
     try:
         await _execute(UUID(run_id), UUID(chat_id), user_text, files)
+    finally:
+        structlog.contextvars.clear_contextvars()
+
+
+async def resume_run_job(
+    ctx: dict, run_id: str, decisions: list[dict], request_id: str | None = None
+) -> None:
+    """arq task: resume a run paused on a human-in-the-loop interrupt. Idempotent — a
+    redelivery after the run already resumed/finished no-ops (mark_run_resumed guard)."""
+    structlog.contextvars.bind_contextvars(request_id=request_id or "-")
+    try:
+        await resume_run(UUID(run_id), decisions)
     finally:
         structlog.contextvars.clear_contextvars()
 
@@ -64,7 +76,7 @@ async def shutdown(ctx: dict) -> None:
 class WorkerSettings:
     """Read by `arq app.worker.WorkerSettings`."""
 
-    functions = [execute_run]
+    functions = [execute_run, resume_run_job]
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)

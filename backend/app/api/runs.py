@@ -23,6 +23,7 @@ from app.db.repos import get_run, list_events, upsert_feedback
 from app.observability import record_score
 from app.redis_client import get_redis
 from app.runtime.events import EMITTERS, run_channel
+from app.services.run_service import _dispatch_resume
 from app.users import UserManager, current_active_user, get_jwt_strategy
 
 router = APIRouter(prefix="/runs", tags=["runs"])
@@ -148,6 +149,46 @@ async def get_one(
         "error_code": row.error_code,
         "tool_calls": row.tool_calls,
     }
+
+
+class ResumeDecision(BaseModel):
+    """One human decision for a paused (awaiting_human) run, one per pending action.
+
+    - approve: run the tool call as-is.
+    - edit: run it with edited name/args (edited_action required).
+    - reject: skip the tool; message explains why (sent back to the model).
+    - respond: answer on the tool's behalf without running it (message = the answer).
+    """
+
+    type: Literal["approve", "edit", "reject", "respond"]
+    message: str | None = None
+    edited_action: dict | None = None  # {"name": str, "args": dict} when type == "edit"
+
+
+class ResumeBody(BaseModel):
+    decisions: list[ResumeDecision]
+
+
+@router.post("/{run_id}/resume", status_code=status.HTTP_202_ACCEPTED)
+async def resume(
+    run_id: UUID,
+    body: ResumeBody,
+    user: Annotated[UserDB, Depends(current_active_user)],
+    session: Annotated[AsyncSession, Depends(get_async_session)],
+) -> dict:
+    """Resume a run paused on a human-in-the-loop interrupt. Owner-checked; the run must
+    be awaiting_human. Dispatches the resume (queue or inline) and returns immediately —
+    progress streams over GET /runs/{id}/events as usual."""
+    row = await get_run(session, run_id=run_id, user_id=user.id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
+    if row.status != "awaiting_human":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"run is not awaiting human input (status={row.status})"
+        )
+    decisions = [d.model_dump(exclude_none=True) for d in body.decisions]
+    await _dispatch_resume(run_id, decisions)
+    return {"run_id": str(run_id), "status": "resuming"}
 
 
 class FeedbackBody(BaseModel):
